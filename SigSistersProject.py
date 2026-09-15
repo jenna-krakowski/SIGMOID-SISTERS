@@ -30,20 +30,6 @@ data = data[
     ["sku", "price", "order", "duration", "category", "quantity"]
 ].copy()
 
-
-# ============================================================
-# CONVERT CATEGORICAL VARIABLES
-# ============================================================
-
-# Convert sku and category to numeric codes
-data["sku"] = pd.Categorical(data["sku"]).codes
-data["category"] = pd.Categorical(data["category"]).codes
-
-
-# Remove rows with missing values
-data = data.dropna()
-
-
 # ============================================================
 # CREATE X AND y
 # ============================================================
@@ -53,10 +39,8 @@ X = data[
     ["sku", "price", "order", "duration", "category"]
 ].to_numpy(dtype=float)
 
-
 # y contains the response variable
 y = data["quantity"].to_numpy(dtype=float).reshape(-1, 1)
-
 
 # ============================================================
 # 2. CREATE TRAINING AND TEST DATA
@@ -71,18 +55,5 @@ X_train, X_test, y_train, y_test = train_test_split(
     shuffle=True
 )
 
-
-# ============================================================
-# 3. STANDARDIZE THE PREDICTORS
-# ============================================================
-
-# Standardize X variables so they are on similar scales
-scaler = StandardScaler()
-
-# Learn scaling from training data
-X_train_scaled = scaler.fit_transform(X_train)
-
-# Apply same scaling to test data
-X_test_scaled = scaler.transform(X_test)
 
 
