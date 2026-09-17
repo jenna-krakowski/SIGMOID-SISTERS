@@ -6,7 +6,7 @@ import tensorflow as tf
 # Input layer
 # There are 5 predictor variables
 inputs = tf.keras.layers.Input(
-    shape=(X_train_scaled.shape[1],)
+    shape=(X_train.shape[1],)
 )
 
 # Hidden layer 1: 16 neurons
