@@ -1,0 +1,33 @@
+{
+  "selected": {
+    "name": "rate_seed_2026",
+    "seed": 2026,
+    "layers": [
+      128,
+      64,
+      32
+    ],
+    "embedding_dim": 1,
+    "sku_effect": true,
+    "embedding_l2": 0.0001,
+    "l2": 1e-05,
+    "lr": 0.001,
+    "batch": 512,
+    "initializer": "he_normal",
+    "activation": "elu",
+    "duration_rate": true,
+    "duration_scale": 1.0020269562822035,
+    "duration_mean": 1.79480342003342,
+    "clipnorm": null,
+    "val_r2": 0.63987135887146,
+    "val_rmse": 30.219619501774527,
+    "epochs": 59,
+    "best_epoch": 41,
+    "seconds": 81.37460095900315,
+    "parameters": 82096
+  },
+  "selection": "lowest validation RMSE among models using SKU; test not used",
+  "target_scale": 50.0,
+  "train_rows": 350000,
+  "validation_rows": 75000
+}

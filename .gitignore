@@ -1,1 +1,13 @@
 .venv/
+
+# Generated files and local-only Assignment 2 history
+.DS_Store
+__pycache__/
+/assignment_2/archive/
+/assignment_2/results/models/*.keras
+!/assignment_2/results/models/rate_seed_2026.keras
+!/assignment_2/results/models/sku_rate_model.keras
+!/assignment_2/results/models/rate_seed_123.keras
+!/assignment_2/results/models/rate_dropout.keras
+!/assignment_2/results/models/sku_offset_model.keras
+!/assignment_2/results/models/sku_embedding.keras

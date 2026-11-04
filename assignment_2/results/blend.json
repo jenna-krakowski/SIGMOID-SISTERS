@@ -1,0 +1,14 @@
+{
+  "members": {
+    "rate_seed_2026": 0.26798217749035547,
+    "sku_rate_model": 0.2588617793168683,
+    "rate_seed_123": 0.1606150621343811,
+    "rate_dropout": 0.0796183732232289,
+    "sku_offset_model": 0.05242841775749534,
+    "sku_embedding": 0.18049419007767073
+  },
+  "validation_r2": 0.642971768751695,
+  "validation_rmse": 30.089254447625684,
+  "selection": "Convex blend fitted on validation rows; test rows not read.",
+  "use_blend": true
+}

@@ -1,0 +1,12 @@
+{
+  "split": "70/15/15",
+  "counts": {
+    "train": 350000,
+    "validation": 75000,
+    "test": 75000
+  },
+  "checks": "passed: disjoint split, training-only scaler, recomputed metrics, saved-model round trip",
+  "test_r2": 0.6310182213783264,
+  "target_r2": 0.65,
+  "target_met": false
+}

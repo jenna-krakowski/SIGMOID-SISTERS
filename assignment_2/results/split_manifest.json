@@ -1,0 +1,9 @@
+{
+  "rows": 500000,
+  "counts": {
+    "train": 350000,
+    "validation": 75000,
+    "test": 75000
+  },
+  "random_state": 42
+}
