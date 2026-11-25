@@ -1,0 +1,113 @@
+---
+title: "Part 2 Cleaning"
+output: html_document
+params:
+  data_dir: "BZAN 542 Final PRoject"
+  export_part2_csv: false
+---
+
+This report checks and joins the FEMA and supplied Census files for the hurricane risk model. Set `export_part2_csv` to `true` to save `part2_hurricane_clean.csv` in the project folder.
+
+## Load the data and check county IDs
+
+```{r load}
+configured_dir <- if (exists("params")) params$data_dir else "BZAN 542 Final PRoject"
+required_files <- c("nri_county_trimmed.csv", "census_data.csv")
+candidates <- path.expand(c(configured_dir, ".", "~/Desktop/BZAN 542 Final PRoject"))
+matches <- vapply(candidates, function(folder) {
+  all(file.exists(file.path(folder, required_files)))
+}, logical(1))
+if (!any(matches)) {
+  stop("Could not find both CSVs. Set data_dir in the notebook header to their folder.")
+}
+data_dir <- normalizePath(candidates[which(matches)[1]])
+
+read_counties <- function(filename) {
+  data <- read.csv(
+    file.path(data_dir, filename),
+    colClasses = c(STCOFIPS = "character"),
+    check.names = FALSE, na.strings = c("", "NA"), strip.white = TRUE
+  )
+  data$STCOFIPS <- trimws(data$STCOFIPS)
+  stopifnot(
+    !anyNA(data$STCOFIPS),
+    all(grepl("^[0-9]{5}$", data$STCOFIPS)),
+    !anyDuplicated(data$STCOFIPS)
+  )
+  data
+}
+
+nri <- read_counties("nri_county_trimmed.csv")
+census <- read_counties("census_data.csv")
+
+knitr::kable(data.frame(
+  dataset = c("FEMA National Risk Index", "Supplied Census"),
+  counties = c(nrow(nri), nrow(census)),
+  fields = c(ncol(nri), ncol(census)),
+  unmatched_counties = c(
+    sum(!nri$STCOFIPS %in% census$STCOFIPS),
+    sum(!census$STCOFIPS %in% nri$STCOFIPS)
+  )
+))
+
+sum(nri$STCOFIPS %in% census$STCOFIPS)
+```
+
+## Census data quality
+
+The join counts above show where Census data are available. Check the supplied Hispanic/Latino count against total population before using it as a predictor.
+
+```{r census-check}
+knitr::kable(data.frame(
+  census_counties = nrow(census),
+  missing_hispanic_or_total = sum(!complete.cases(census[c("HISPANIC_LATINO_POP", "TOT_POP")])),
+  hispanic_count_equals_total = sum(census$HISPANIC_LATINO_POP == census$TOT_POP, na.rm = TRUE)
+))
+```
+
+```{r profile}
+profile <- function(data) {
+  data.frame(
+    field = names(data),
+    type = vapply(data, function(x) class(x)[1], character(1)),
+    missing = vapply(data, function(x) sum(is.na(x)), integer(1)),
+    zeros = vapply(data, function(x) {
+      if (is.numeric(x)) sum(x == 0, na.rm = TRUE) else NA_integer_
+    }, integer(1)),
+    row.names = NULL
+  )
+}
+
+```
+
+## Clean the Part 2 hurricane data
+
+Join the supplied Census data to FEMA by county FIPS. Keep the hurricane risk score as the outcome and retain frequency, exposure, renter share, and the share of residents aged 65 or older as predictors. Recorded zeros are valid. The optional ACS join is handled in the modeling notebook.
+
+```{r part2-clean}
+hazard_fields <- c("HRCN_AFREQ", "HRCN_EXP_AREA", "HRCN_EXPB", "HRCN_EXPP")
+county_match <- match(nri$STCOFIPS, census$STCOFIPS)
+part2 <- nri[c("STCOFIPS", "STATEABBRV", "HRCN_RISKS", hazard_fields)]
+part2$share_65plus <- with(census, (`65_74_POP` + `75_84_POP` + `85_PLUS_POP`) / TOT_POP)[county_match]
+part2$renter_share <- with(census, RENTER_OCCUPIED_HOUSING_UNITS / OCCUPIED_HOUSING_UNITS)[county_match]
+
+has_score <- is.finite(part2$HRCN_RISKS)
+has_hazard_data <- Reduce(`&`, lapply(part2[hazard_fields], function(x) is.finite(x) & x >= 0))
+has_census_data <- Reduce(`&`, lapply(part2[c("share_65plus", "renter_share")], function(x) {
+  is.finite(x) & x >= 0 & x <= 1
+}))
+
+knitr::kable(data.frame(
+  step = c("Starting FEMA records", "Hurricane score available",
+           "Also have hurricane predictors", "Also have valid Census shares"),
+  counties = c(nrow(part2), sum(has_score), sum(has_score & has_hazard_data),
+               sum(has_score & has_hazard_data & has_census_data))
+))
+
+part2 <- part2[has_score & has_hazard_data & has_census_data, ]
+knitr::kable(profile(part2))
+
+if (exists("params") && isTRUE(params$export_part2_csv)) {
+  write.csv(part2, file.path(data_dir, "part2_hurricane_clean.csv"), row.names = FALSE)
+}
+```

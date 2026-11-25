@@ -1,0 +1,146 @@
+---
+title: "Part 1 Cleaning"
+output: html_document
+params:
+  data_dir: "BZAN 542 Final PRoject"
+  export_clean_csv: false
+---
+
+This report audits the FEMA file and prepares the county data for the social vulnerability and expected loss analysis. Set `export_clean_csv` to `true` to save `part1_fema_clean.csv` in the project folder.
+
+## Load the data and check county IDs
+
+```{r load}
+configured_dir <- if (exists("params")) params$data_dir else "BZAN 542 Final PRoject"
+required_files <- "nri_county_trimmed.csv"
+candidates <- path.expand(c(configured_dir, ".", "~/Desktop/BZAN 542 Final PRoject"))
+matches <- vapply(candidates, function(folder) {
+  all(file.exists(file.path(folder, required_files)))
+}, logical(1))
+if (!any(matches)) {
+  stop("Could not find the FEMA CSV. Set data_dir in the notebook header to their folder.")
+}
+data_dir <- normalizePath(candidates[which(matches)[1]])
+
+read_counties <- function(filename) {
+  data <- read.csv(
+    file.path(data_dir, filename),
+    colClasses = c(STCOFIPS = "character"),
+    check.names = FALSE, na.strings = c("", "NA"), strip.white = TRUE
+  )
+  data$STCOFIPS <- trimws(data$STCOFIPS)
+  stopifnot(
+    !anyNA(data$STCOFIPS),
+    all(grepl("^[0-9]{5}$", data$STCOFIPS)),
+    !anyDuplicated(data$STCOFIPS)
+  )
+  data
+}
+
+nri <- read_counties("nri_county_trimmed.csv")
+```
+
+## What is in the FEMA file?
+
+This inventory covers every column. A recorded zero is counted separately from missing data.
+
+```{r inventory}
+profile <- function(data) {
+  data.frame(
+    field = names(data),
+    type = vapply(data, function(x) class(x)[1], character(1)),
+    missing = vapply(data, function(x) sum(is.na(x)), integer(1)),
+    zeros = vapply(data, function(x) {
+      if (is.numeric(x)) sum(x == 0, na.rm = TRUE) else NA_integer_
+    }, integer(1)),
+    row.names = NULL
+  )
+}
+
+inventory <- profile(nri)
+knitr::kable(head(inventory[order(-inventory$missing), ], 12))
+```
+
+<details>
+<summary>Expand the full FEMA inventory</summary>
+
+```{r all-fields}
+knitr::kable(inventory)
+```
+
+</details>
+
+## Clean the Part 1 fields
+
+Keep counties with one of FEMA's five vulnerability ratings. Keep valid zero losses and convert nonfinite numeric values to missing. Stop if any loss is negative so it can be checked against the source. Retain counties with missing hazard estimates for analyses of the hazards they do have.
+
+```{r clean}
+ratings <- c("Very Low", "Relatively Low", "Relatively Moderate",
+             "Relatively High", "Very High")
+loss_fields <- grep("^EAL_VAL|^[A-Z]{4}_EAL(B|P|PE|T)$", names(nri), value = TRUE)
+numeric_fields <- c("SOVI_SCORE", loss_fields)
+id_fields <- c("STCOFIPS", "STATE", "STATEABBRV", "COUNTY")
+nri$SOVI_RATNG <- trimws(nri$SOVI_RATNG)
+
+table(nri$SOVI_RATNG, useNA = "ifany")
+stopifnot(all(vapply(nri[numeric_fields], is.numeric, logical(1))))
+stopifnot(!any(vapply(nri[loss_fields], function(x) {
+  any(is.finite(x) & x < 0)
+}, logical(1))))
+
+part1 <- nri[nri$SOVI_RATNG %in% ratings,
+             c(id_fields, "SOVI_RATNG", numeric_fields)]
+part1$SOVI_RATNG <- factor(part1$SOVI_RATNG, levels = ratings, ordered = TRUE)
+part1[numeric_fields] <- lapply(part1[numeric_fields], function(x) {
+  replace(x, !is.finite(x), NA_real_)
+})
+
+knitr::kable(data.frame(
+  original_counties = nrow(nri),
+  excluded_rating = nrow(nri) - nrow(part1),
+  retained_counties = nrow(part1),
+  usable_total_loss = sum(!is.na(part1$EAL_VALT))
+))
+```
+
+## What is usable for the analysis?
+
+For each loss, use the counties with an available value for that particular field. Review the counts and distribution before deciding which hazard comparisons to present.
+
+```{r review}
+coverage <- profile(part1[loss_fields])
+coverage$available <- nrow(part1) - coverage$missing
+focus <- c("EAL_VALT", "EAL_VALB", "EAL_VALPE", "EAL_VALA", "CWAV_EALT", "HRCN_EALPE")
+knitr::kable(coverage[match(focus, coverage$field), ])
+
+group_summary <- do.call(rbind, lapply(ratings, function(rating) {
+  loss <- part1$EAL_VALT[part1$SOVI_RATNG == rating]
+  data.frame(
+    rating = rating, counties = length(loss), missing = sum(is.na(loss)),
+    median_millions = median(loss, na.rm = TRUE) / 1e6,
+    mean_millions = mean(loss, na.rm = TRUE) / 1e6
+  )
+}))
+knitr::kable(group_summary, digits = 2)
+
+hist(log10(part1$EAL_VALT[!is.na(part1$EAL_VALT) & part1$EAL_VALT > 0]),
+     breaks = 30, main = "County expected annual loss",
+     xlab = "Log10 of expected annual loss in dollars", col = "#9CC9D7")
+```
+
+<details>
+<summary>Expand the coverage table for all loss fields</summary>
+
+```{r coverage}
+knitr::kable(coverage)
+```
+
+</details>
+
+```{r export}
+if (exists("params") && isTRUE(params$export_clean_csv)) {
+  write.csv(part1, file.path(data_dir, "part1_fema_clean.csv"),
+            row.names = FALSE, na = "")
+}
+```
+
