@@ -1,0 +1,1107 @@
+---
+title: "Part 2: Predicting County-Level Hurricane Risk"
+author: "MSBA Final Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+params:
+  data_dir: "BZAN 542 Final PRoject"
+  test_prop: 0.20
+  seed: 542
+editor_options: 
+  chunk_output_type: console
+---
+
+# Project overview
+
+This analysis predicts the FEMA National Risk Index hurricane risk score (`HRCN_RISKS`) for U.S. counties. It combines FEMA hurricane hazard/exposure measures, the supplied Census file, and the previously created ACS county-level file.
+
+The ACS data are **loaded from `acs_community_data.csv`**. This report does not call the Census API or require an API key, so the same file can be used by every project teammate.
+
+The response variable is `HRCN_RISKS`. No Expected Annual Loss (`EAL`) variables are used as predictors. The NOAA sea-level-rise housing exposure measure is not included. FEMA social vulnerability fields are retained for a separate county-prioritization analysis, but are not used as predictors in the hurricane-risk models. The final section combines social vulnerability and hurricane risk to identify counties that may merit closer preparedness attention.
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "tidyverse", "tidymodels", "ranger", "glmnet",
+  "xgboost", "corrplot", "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install these packages before knitting: ",
+    paste(missing_packages, collapse = ", "),
+    "\nRun install.packages(c(",
+    paste(sprintf('"%s"', missing_packages), collapse = ", "),
+    "))"
+  )
+}
+
+library(tidyverse)
+library(tidymodels)
+library(ranger)
+library(glmnet)
+library(xgboost)
+library(corrplot)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12))
+tidymodels_prefer()
+
+set.seed(params$seed)
+```
+
+# 2. Locate and load the input files
+
+Place these three CSV files in the same project folder:
+
+- `nri_county_trimmed.csv`
+- `census_data.csv`
+- `acs_community_data.csv`
+
+Set `data_dir` in the YAML header to that folder. If the folder is the current working directory, use `"."`.
+
+```{r load-data}
+required_files <- c(
+  "nri_county_trimmed.csv",
+  "census_data.csv",
+  "acs_community_data.csv"
+)
+
+candidate_dirs <- unique(path.expand(c(
+  params$data_dir,
+  ".",
+  "~/Desktop/BZAN 542 Final PRoject"
+)))
+
+matching_dirs <- candidate_dirs[
+  vapply(
+    candidate_dirs,
+    function(folder) all(file.exists(file.path(folder, required_files))),
+    logical(1)
+  )
+]
+
+if (length(matching_dirs) == 0) {
+  stop(
+    "Could not find all three required CSV files. ",
+    "Update data_dir in the YAML header. Files needed: ",
+    paste(required_files, collapse = ", ")
+  )
+}
+
+data_dir <- normalizePath(matching_dirs[1])
+
+read_counties <- function(filename) {
+  dat <- read.csv(
+    file.path(data_dir, filename),
+    colClasses = c(STCOFIPS = "character"),
+    check.names = FALSE,
+    na.strings = c("", "NA"),
+    strip.white = TRUE
+  )
+
+  if (!"STCOFIPS" %in% names(dat)) {
+    stop(filename, " does not contain STCOFIPS.")
+  }
+
+  dat$STCOFIPS <- trimws(dat$STCOFIPS)
+
+  if (anyNA(dat$STCOFIPS) ||
+      any(!grepl("^[0-9]{5}$", dat$STCOFIPS))) {
+    stop(filename, " has missing or invalid five-character county FIPS values.")
+  }
+
+  if (anyDuplicated(dat$STCOFIPS)) {
+    stop(filename, " has duplicate STCOFIPS values. Resolve duplicates before joining.")
+  }
+
+  dat
+}
+
+nri <- read_counties("nri_county_trimmed.csv")
+census <- read_counties("census_data.csv")
+acs <- read_counties("acs_community_data.csv")
+
+data_file_check <- tibble(
+  dataset = c("FEMA NRI", "Supplied Census", "ACS community data"),
+  counties = c(nrow(nri), nrow(census), nrow(acs)),
+  variables = c(ncol(nri), ncol(census), ncol(acs))
+)
+
+kable(data_file_check, caption = "Input file dimensions")
+```
+
+# 3. Check the input data and county matches
+
+```{r input-checks}
+county_match_check <- tibble(
+  comparison = c(
+    "FEMA counties also in supplied Census",
+    "FEMA counties also in ACS",
+    "Supplied Census counties also in FEMA",
+    "ACS counties also in FEMA"
+  ),
+  matched_counties = c(
+    sum(nri$STCOFIPS %in% census$STCOFIPS),
+    sum(nri$STCOFIPS %in% acs$STCOFIPS),
+    sum(census$STCOFIPS %in% nri$STCOFIPS),
+    sum(acs$STCOFIPS %in% nri$STCOFIPS)
+  )
+)
+
+kable(county_match_check)
+
+# Check the supplied Hispanic/Latino field before deciding whether to use it.
+# It is intentionally not used as a model predictor.
+if (all(c("HISPANIC_LATINO_POP", "TOT_POP") %in% names(census))) {
+  tibble(
+    census_counties = nrow(census),
+    missing_hispanic_or_total = sum(
+      !complete.cases(census[c("HISPANIC_LATINO_POP", "TOT_POP")])
+    ),
+    hispanic_count_equals_total = sum(
+      census$HISPANIC_LATINO_POP == census$TOT_POP,
+      na.rm = TRUE
+    )
+  ) |>
+    kable(caption = "Check of supplied Hispanic/Latino population field")
+}
+```
+
+# 4. Build the county modeling dataset
+
+The county FIPS code is the join key. FEMA provides the outcome and hurricane hazard/exposure measures. The supplied Census file provides the demographic and density measures. The ACS file adds community characteristics.
+
+For the first modeling pass, highly redundant predictors are not all included together:
+
+- `renter_share` is retained instead of `owner_share` because the two are complements.
+- `share_65plus` is retained instead of `median_age`.
+- `population_density` is retained instead of `housing_density`.
+- `HRCN_EXPB` is retained instead of `HRCN_EXPP` because the two FEMA exposure measures are extremely highly correlated.
+
+These choices reduce unnecessary multicollinearity in the linear models. The random forest and XGBoost models also use this consistent predictor set to make model comparisons easier to interpret.
+
+```{r build-data}
+# Required FEMA columns
+hazard_fields <- c(
+  "HRCN_AFREQ",
+  "HRCN_EXP_AREA",
+  "HRCN_EXPB"
+)
+
+required_nri_fields <- c(
+  "STCOFIPS", "STATEABBRV", "AREA", "HRCN_RISKS",
+  hazard_fields
+)
+
+missing_nri_fields <- setdiff(required_nri_fields, names(nri))
+if (length(missing_nri_fields) > 0) {
+  stop("Missing FEMA fields: ", paste(missing_nri_fields, collapse = ", "))
+}
+
+required_census_fields <- c(
+  "STCOFIPS", "65_74_POP", "75_84_POP", "85_PLUS_POP",
+  "TOT_POP", "RENTER_OCCUPIED_HOUSING_UNITS",
+  "OCCUPIED_HOUSING_UNITS"
+)
+
+missing_census_fields <- setdiff(required_census_fields, names(census))
+if (length(missing_census_fields) > 0) {
+  stop("Missing supplied Census fields: ",
+       paste(missing_census_fields, collapse = ", "))
+}
+
+required_acs_fields <- c(
+  "STCOFIPS", "median_income", "poverty_rate",
+  "no_vehicle_share", "mobile_home_share",
+  "unemployment_rate", "no_hs_diploma_share",
+  "median_gross_rent", "median_home_value"
+)
+
+missing_acs_fields <- setdiff(required_acs_fields, names(acs))
+if (length(missing_acs_fields) > 0) {
+  stop("Missing ACS fields: ", paste(missing_acs_fields, collapse = ", "))
+}
+
+# Start with FEMA fields
+# Retain FEMA social vulnerability fields for the final cross-part analysis.
+# These fields are NOT included in the hurricane model predictors.
+required_sovi_fields <- c("SOVI_RATNG", "SOVI_SCORE")
+missing_sovi_fields <- setdiff(required_sovi_fields, names(nri))
+if (length(missing_sovi_fields) > 0) {
+  stop(
+    "The FEMA file is missing the social vulnerability fields needed for the combined analysis: ",
+    paste(missing_sovi_fields, collapse = ", ")
+  )
+}
+
+county_name_field <- intersect(c("COUNTY", "COUNTYNAME", "COUNTY_NAME"), names(nri))[1]
+county_name_data <- if (!is.na(county_name_field)) {
+  nri |> transmute(STCOFIPS, county_name = .data[[county_name_field]])
+} else {
+  nri |> transmute(STCOFIPS, county_name = NA_character_)
+}
+
+part2 <- nri |>
+  select(
+    STCOFIPS, STATEABBRV, AREA, HRCN_RISKS,
+    SOVI_RATNG, SOVI_SCORE,
+    all_of(hazard_fields)
+  ) |>
+  left_join(county_name_data, by = "STCOFIPS") |>
+  left_join(
+    census |>
+      transmute(
+        STCOFIPS,
+        share_65plus = (
+          `65_74_POP` + `75_84_POP` + `85_PLUS_POP`
+        ) / TOT_POP,
+        renter_share = RENTER_OCCUPIED_HOUSING_UNITS /
+          OCCUPIED_HOUSING_UNITS,
+        population_density = TOT_POP
+      ),
+    by = "STCOFIPS"
+  ) |>
+  mutate(
+    population_density = population_density / AREA
+  ) |>
+  left_join(
+    acs |>
+      select(all_of(required_acs_fields)),
+    by = "STCOFIPS"
+  )
+
+# Confirm one row per county
+stopifnot(!anyDuplicated(part2$STCOFIPS))
+
+# Keep counties with an observed hurricane risk score.
+# Missing predictor values are handled inside the modeling recipe.
+part2 <- part2 |>
+  filter(is.finite(HRCN_RISKS))
+
+# Basic valid-range checks. Invalid ratios are set to NA so the
+# recipe can impute them using training data only.
+ratio_vars <- c(
+  "share_65plus", "renter_share", "poverty_rate",
+  "no_vehicle_share", "mobile_home_share",
+  "unemployment_rate", "no_hs_diploma_share"
+)
+
+for (v in ratio_vars) {
+  part2[[v]][
+    !is.finite(part2[[v]]) |
+      part2[[v]] < 0 |
+      part2[[v]] > 1
+  ] <- NA_real_
+}
+
+# Convert non-finite or negative values in nonnegative measures to NA.
+# Some ACS tables can contain special negative codes for unavailable estimates.
+nonnegative_vars <- c(
+  "HRCN_AFREQ", "HRCN_EXP_AREA", "HRCN_EXPB",
+  "population_density", "median_income",
+  "median_gross_rent", "median_home_value"
+)
+
+for (v in nonnegative_vars) {
+  part2[[v]][!is.finite(part2[[v]]) | part2[[v]] < 0] <- NA_real_
+}
+
+# Log transforms reduce skew in nonnegative measures.
+# Original columns are retained for descriptive summaries.
+safe_log1p <- function(x) {
+  x[!is.finite(x) | x < 0] <- NA_real_
+  log1p(x)
+}
+
+part2 <- part2 |>
+  mutate(
+    log_hurricane_frequency = safe_log1p(HRCN_AFREQ),
+    log_hurricane_exposed_area = safe_log1p(HRCN_EXP_AREA),
+    log_hurricane_exposed_building_value = safe_log1p(HRCN_EXPB),
+    log_population_density = safe_log1p(population_density),
+    log_median_income = safe_log1p(median_income),
+    log_median_gross_rent = safe_log1p(median_gross_rent),
+    log_median_home_value = safe_log1p(median_home_value)
+  )
+
+# Never use EAL variables as predictors. This explicit check
+# guards against accidentally adding any EAL field later.
+eal_predictor_names <- names(part2)[grepl("EAL", names(part2), ignore.case = TRUE)]
+if (length(eal_predictor_names) > 0) {
+  stop("EAL fields detected in the modeling data: ",
+       paste(eal_predictor_names, collapse = ", "))
+}
+
+dataset_overview <- tibble(
+  starting_fema_counties = nrow(nri),
+  counties_with_risk_score = nrow(part2),
+  predictors = ncol(part2) - 4,
+  missing_acs_rows = sum(!complete.cases(part2[required_acs_fields[-1]]))
+)
+
+kable(dataset_overview, caption = "Final modeling dataset overview")
+```
+
+## 4.1 Predictor definitions
+
+```{r predictor-definitions}
+predictor_definitions <- tribble(
+  ~variable, ~description, ~source,
+  "HRCN_AFREQ", "Annualized hurricane frequency", "FEMA NRI",
+  "HRCN_EXP_AREA", "Area exposed to hurricanes", "FEMA NRI",
+  "HRCN_EXPB", "Building value exposed to hurricanes", "FEMA NRI",
+  "share_65plus", "Share of county population age 65 or older", "Supplied Census",
+  "renter_share", "Share of occupied housing units that are renter occupied", "Supplied Census",
+  "population_density", "Population per unit of county area", "Supplied Census + FEMA area",
+  "median_income", "Median household income", "2024 ACS 5-year",
+  "poverty_rate", "Share of population below poverty level", "2024 ACS 5-year",
+  "no_vehicle_share", "Share of households with no vehicle", "2024 ACS 5-year",
+  "mobile_home_share", "Share of housing units that are mobile homes", "2024 ACS 5-year",
+  "unemployment_rate", "Unemployment rate", "2024 ACS 5-year",
+  "no_hs_diploma_share", "Share of adults age 25+ without high school diploma", "2024 ACS 5-year",
+  "median_gross_rent", "Median gross rent", "2024 ACS 5-year",
+  "median_home_value", "Median home value", "2024 ACS 5-year"
+)
+
+kable(predictor_definitions)
+```
+
+# 5. Exploratory data analysis
+
+## 5.1 Missingness and descriptive statistics
+
+```{r missingness}
+model_variables <- c(
+  "HRCN_RISKS",
+  "HRCN_AFREQ", "HRCN_EXP_AREA", "HRCN_EXPB",
+  "share_65plus", "renter_share", "population_density",
+  "median_income", "poverty_rate", "no_vehicle_share",
+  "mobile_home_share", "unemployment_rate",
+  "no_hs_diploma_share", "median_gross_rent", "median_home_value"
+)
+
+missing_summary <- tibble(
+  variable = model_variables,
+  missing_count = vapply(part2[model_variables], function(x) sum(is.na(x)), integer(1)),
+  missing_percent = vapply(
+    part2[model_variables],
+    function(x) mean(is.na(x)) * 100,
+    numeric(1)
+  )
+) |>
+  arrange(desc(missing_percent))
+
+kable(missing_summary, digits = 1)
+
+summary(part2[model_variables])
+```
+
+## 5.2 Distribution of hurricane risk
+
+```{r risk-distribution}
+ggplot(part2, aes(x = HRCN_RISKS)) +
+  geom_histogram(bins = 35, color = "white") +
+  labs(
+    title = "Distribution of County Hurricane Risk Scores",
+    x = "FEMA Hurricane Risk Score",
+    y = "Number of counties"
+  )
+```
+
+## 5.3 Correlations
+
+```{r correlations, fig.width=10, fig.height=9}
+cor_data <- part2 |>
+  select(all_of(model_variables)) |>
+  mutate(across(everything(), as.numeric))
+
+cor_matrix <- cor(
+  cor_data,
+  use = "pairwise.complete.obs"
+)
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.srt = 45,
+  addCoef.col = "black",
+  number.cex = 0.55
+)
+```
+
+## 5.4 Selected relationships with hurricane risk
+
+```{r risk-relationships, fig.width=8, fig.height=5}
+plot_relationship <- function(data, xvar, xlab) {
+  ggplot(data, aes(x = .data[[xvar]], y = HRCN_RISKS)) +
+    geom_point(alpha = 0.35) +
+    geom_smooth(method = "loess", color = "red", se = TRUE) +
+    labs(
+      title = paste("Hurricane Risk vs.", xlab),
+      x = xlab,
+      y = "FEMA Hurricane Risk Score"
+    )
+}
+
+plot_relationship(part2, "HRCN_AFREQ", "Annualized hurricane frequency")
+plot_relationship(part2, "population_density", "Population density")
+plot_relationship(part2, "share_65plus", "Share of population age 65+")
+plot_relationship(part2, "poverty_rate", "Poverty rate")
+plot_relationship(part2, "mobile_home_share", "Mobile home share")
+```
+
+# 6. Define modeling datasets
+
+We evaluate two predictor groups:
+
+1. **Community-only model:** Census and ACS community characteristics, without FEMA hurricane hazard/exposure measures. This shows how much risk can be explained by county characteristics alone.
+2. **Combined model:** Community characteristics plus FEMA hurricane frequency and exposure measures.
+
+The combined model is expected to perform better because FEMA's frequency and exposure measures are closely related to the construction of the NRI risk score. We will interpret that carefully rather than treating it as a surprising discovery.
+
+The target is not transformed. The log-transformed versions of skewed predictors are used in the models.
+
+```{r modeling-data}
+community_predictors <- c(
+  "share_65plus",
+  "renter_share",
+  "log_population_density",
+  "log_median_income",
+  "poverty_rate",
+  "no_vehicle_share",
+  "mobile_home_share",
+  "unemployment_rate",
+  "no_hs_diploma_share",
+  "log_median_gross_rent",
+  "log_median_home_value"
+)
+
+hazard_predictors <- c(
+  "log_hurricane_frequency",
+  "log_hurricane_exposed_area",
+  "log_hurricane_exposed_building_value"
+)
+
+community_data <- part2 |>
+  select(HRCN_RISKS, all_of(community_predictors))
+
+combined_data <- part2 |>
+  select(HRCN_RISKS, all_of(c(community_predictors, hazard_predictors)))
+
+# Use the same county split for both predictor groups.
+# Split county IDs once, then construct both modeling datasets from those IDs.
+set.seed(params$seed)
+county_split <- initial_split(
+  part2 |> select(STCOFIPS, HRCN_RISKS),
+  prop = 1 - params$test_prop
+)
+
+train_ids <- training(county_split)$STCOFIPS
+test_ids <- testing(county_split)$STCOFIPS
+
+train_part2 <- part2 |> filter(STCOFIPS %in% train_ids)
+test_part2 <- part2 |> filter(STCOFIPS %in% test_ids)
+
+train_community <- train_part2 |>
+  select(HRCN_RISKS, all_of(community_predictors))
+
+test_community <- test_part2 |>
+  select(HRCN_RISKS, all_of(community_predictors))
+
+train_combined <- train_part2 |>
+  select(HRCN_RISKS, all_of(c(community_predictors, hazard_predictors)))
+
+test_combined <- test_part2 |>
+  select(HRCN_RISKS, all_of(c(community_predictors, hazard_predictors)))
+
+split_summary <- tibble(
+  sample = c("Training", "Test"),
+  counties = c(nrow(train_part2), nrow(test_part2))
+)
+
+kable(split_summary)
+```
+
+# 7. Modeling approach
+
+All models are evaluated on the same held-out test counties. Missing predictor values are imputed using medians calculated from the training data only. State is not included as a predictor in this first model version.
+
+We compare:
+
+- Naive mean benchmark
+- Multiple linear regression
+- Elastic net regression
+- Random forest
+- XGBoost
+
+The community-only and combined linear models are both included to show the value added by FEMA hazard/exposure variables. The machine-learning models use the combined predictor set.
+
+## 7.1 Preprocessing recipe
+
+```{r recipes}
+community_recipe <- recipe(HRCN_RISKS ~ ., data = train_community) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+combined_recipe <- recipe(HRCN_RISKS ~ ., data = train_combined) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+```
+
+## 7.2 Naive benchmark
+
+The naive model predicts the average hurricane risk score in the training data for every county in the test data.
+
+```{r naive-model}
+naive_prediction <- rep(
+  mean(train_combined$HRCN_RISKS, na.rm = TRUE),
+  nrow(test_combined)
+)
+```
+
+## 7.3 Multiple linear regression
+
+```{r linear-model}
+community_lm_workflow <- workflow() |>
+  add_recipe(community_recipe) |>
+  add_model(linear_reg() |> set_engine("lm"))
+
+combined_lm_workflow <- workflow() |>
+  add_recipe(combined_recipe) |>
+  add_model(linear_reg() |> set_engine("lm"))
+
+community_lm_fit <- fit(
+  community_lm_workflow,
+  data = train_community
+)
+
+combined_lm_fit <- fit(
+  combined_lm_workflow,
+  data = train_combined
+)
+
+community_lm_predictions <- predict(
+  community_lm_fit,
+  new_data = test_community
+) |>
+  bind_cols(test_community |> select(HRCN_RISKS))
+
+combined_lm_predictions <- predict(
+  combined_lm_fit,
+  new_data = test_combined
+) |>
+  bind_cols(test_combined |> select(HRCN_RISKS))
+```
+
+## 7.4 Elastic net regression
+
+Elastic net combines LASSO and ridge regularization. The penalty and mixture are selected using cross-validation on the training data only.
+
+```{r elastic-net, message=FALSE, warning=FALSE}
+set.seed(params$seed)
+
+enet_workflow <- workflow() |>
+  add_recipe(combined_recipe) |>
+  add_model(
+    linear_reg(
+      penalty = tune(),
+      mixture = tune()
+    ) |>
+      set_engine("glmnet")
+  )
+
+enet_folds <- vfold_cv(train_combined, v = 5)
+
+enet_grid <- grid_regular(
+  penalty(range = c(-4, 1)),
+  mixture(),
+  levels = c(penalty = 15, mixture = 5)
+)
+
+enet_tune <- tune_grid(
+  enet_workflow,
+  resamples = enet_folds,
+  grid = enet_grid,
+  metrics = metric_set(rmse, mae, rsq),
+  control = control_grid(save_pred = TRUE)
+)
+
+best_enet <- select_best(enet_tune, metric = "rmse")
+
+final_enet_workflow <- finalize_workflow(
+  enet_workflow,
+  best_enet
+)
+
+enet_fit <- fit(
+  final_enet_workflow,
+  data = train_combined
+)
+
+enet_predictions <- predict(
+  enet_fit,
+  new_data = test_combined
+) |>
+  bind_cols(test_combined |> select(HRCN_RISKS))
+
+best_enet
+```
+
+## 7.5 Random forest
+
+```{r random-forest}
+set.seed(params$seed)
+
+rf_workflow <- workflow() |>
+  add_recipe(combined_recipe) |>
+  add_model(
+    rand_forest(
+      trees = 600,
+      mtry = 5,
+      min_n = 5
+    ) |>
+      set_engine("ranger", importance = "permutation") |>
+      set_mode("regression")
+  )
+
+rf_fit <- fit(
+  rf_workflow,
+  data = train_combined
+)
+
+rf_predictions <- predict(
+  rf_fit,
+  new_data = test_combined
+) |>
+  bind_cols(test_combined |> select(HRCN_RISKS))
+```
+
+## 7.6 XGBoost
+
+```{r xgboost}
+set.seed(params$seed)
+
+xgb_workflow <- workflow() |>
+  add_recipe(combined_recipe) |>
+  add_model(
+    boost_tree(
+      trees = 800,
+      tree_depth = 6,
+      learn_rate = 0.03,
+      min_n = 5,
+      loss_reduction = 0,
+      sample_size = 0.8
+    ) |>
+      set_engine("xgboost") |>
+      set_mode("regression")
+  )
+
+xgb_fit <- fit(
+  xgb_workflow,
+  data = train_combined
+)
+
+xgb_predictions <- predict(
+  xgb_fit,
+  new_data = test_combined
+) |>
+  bind_cols(test_combined |> select(HRCN_RISKS))
+```
+
+# 8. Compare model performance
+
+RMSE and MAE are measured in FEMA hurricane risk-score points; lower values are better. \(R^2\) describes the proportion of test-set variation explained by the predictions. A negative test \(R^2\) means the model performs worse than predicting the test-set mean.
+
+```{r model-comparison}
+calculate_metrics <- function(prediction_data, model_name) {
+  prediction_data |>
+    metrics(truth = HRCN_RISKS, estimate = .pred) |>
+    select(.metric, .estimate) |>
+    pivot_wider(names_from = .metric, values_from = .estimate) |>
+    mutate(model = model_name, .before = 1)
+}
+
+naive_predictions <- tibble(
+  HRCN_RISKS = test_combined$HRCN_RISKS,
+  .pred = naive_prediction
+)
+
+model_comparison <- bind_rows(
+  calculate_metrics(naive_predictions, "Naive mean benchmark"),
+  calculate_metrics(community_lm_predictions, "Community-only linear regression"),
+  calculate_metrics(combined_lm_predictions, "Combined linear regression"),
+  calculate_metrics(enet_predictions, "Elastic net"),
+  calculate_metrics(rf_predictions, "Random forest"),
+  calculate_metrics(xgb_predictions, "XGBoost")
+) |>
+  arrange(rmse)
+
+kable(
+  model_comparison,
+  digits = 3,
+  caption = "Held-out test-set model performance"
+)
+
+best_model_name <- model_comparison$model[1]
+best_model_rmse <- model_comparison$rmse[1]
+
+cat(
+  "Best model by test RMSE:", best_model_name,
+  "\nTest RMSE:", round(best_model_rmse, 3)
+)
+```
+
+## 8.1 Actual versus predicted values
+
+```{r actual-vs-predicted, fig.width=8, fig.height=6}
+prediction_plot_data <- bind_rows(
+  community_lm_predictions |> mutate(model = "Community-only linear regression"),
+  combined_lm_predictions |> mutate(model = "Combined linear regression"),
+  enet_predictions |> mutate(model = "Elastic net"),
+  rf_predictions |> mutate(model = "Random forest"),
+  xgb_predictions |> mutate(model = "XGBoost")
+)
+
+ggplot(prediction_plot_data, aes(x = HRCN_RISKS, y = .pred)) +
+  geom_point(alpha = 0.35) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~ model) +
+  labs(
+    title = "Actual vs. Predicted County Hurricane Risk",
+    x = "Actual FEMA hurricane risk score",
+    y = "Predicted hurricane risk score"
+  )
+```
+
+# 9. Identify important predictors
+
+For the random forest, permutation importance estimates how much prediction performance worsens when a predictor is shuffled. Larger values indicate greater predictive importance. Importance is not proof of causation.
+
+```{r variable-importance}
+rf_engine <- extract_fit_engine(rf_fit)
+
+rf_importance <- enframe(
+  rf_engine$variable.importance,
+  name = "predictor",
+  value = "importance"
+) |>
+  arrange(desc(importance))
+
+kable(
+  rf_importance,
+  digits = 3,
+  caption = "Random forest permutation importance"
+)
+
+ggplot(
+  rf_importance |> slice_max(importance, n = 15),
+  aes(x = reorder(predictor, importance), y = importance)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Most Important Predictors in the Random Forest",
+    x = NULL,
+    y = "Permutation importance"
+  )
+```
+
+## 9.1 XGBoost variable importance
+
+XGBoost is the best-performing model in the current test-set comparison. Its gain-based importance summarizes how much each predictor contributes to improvements in the model's tree splits. This is a predictive importance measure, not evidence of causation. Because FEMA hurricane frequency is closely related to the FEMA risk score, interpret its importance with that context in mind.
+
+```{r xgboost-importance}
+xgb_engine <- extract_fit_engine(xgb_fit)
+
+xgb_importance <- xgboost::xgb.importance(model = xgb_engine) |>
+  as_tibble() |>
+  transmute(
+    predictor = Feature,
+    importance = Gain,
+    cover = Cover,
+    frequency = Frequency
+  ) |>
+  arrange(desc(importance))
+
+kable(
+  xgb_importance,
+  digits = 4,
+  caption = "XGBoost gain-based variable importance"
+)
+
+ggplot(
+  xgb_importance |> slice_max(importance, n = 15),
+  aes(x = reorder(predictor, importance), y = importance)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Most Important Predictors in XGBoost",
+    x = NULL,
+    y = "Importance (Gain)"
+  )
+```
+
+## 9.2 Linear regression coefficients
+
+The standardized linear regression coefficients make it easier to compare the relative scale of predictors. Coefficients describe associations conditional on the other included variables; they should not be interpreted as causal effects.
+
+```{r linear-coefficients}
+linear_coefficients <- tidy(extract_fit_parsnip(combined_lm_fit)) |>
+  filter(term != "(Intercept)") |>
+  mutate(abs_estimate = abs(estimate)) |>
+  arrange(desc(abs_estimate))
+
+kable(
+  linear_coefficients,
+  digits = 4,
+  caption = "Combined linear regression coefficients"
+)
+```
+
+# 10. Connect Part 1 and Part 2: county prioritization
+
+Part 1 examines how expected annual losses differ across FEMA social vulnerability groups. Part 2 models county hurricane risk. This section connects those analyses by identifying counties that have both high social vulnerability and high hurricane risk.
+
+This is a **screening and prioritization framework**, not an official FEMA designation and not a causal analysis. For a transparent definition, this report classifies a county as:
+
+- **High social vulnerability:** FEMA `SOVI_RATNG` is `Very High`.
+- **High hurricane risk:** FEMA `HRCN_RISKS` is at or above the 75th percentile among counties in the Part 2 analysis.
+
+The social vulnerability rating is retained for this separate analysis only. It is not used as a predictor in any model above.
+
+```{r county-prioritization}
+# Normalize rating text to avoid capitalization or whitespace differences.
+part2_priority <- part2 |>
+  mutate(
+    sovi_rating_clean = str_to_lower(str_squish(as.character(SOVI_RATNG))),
+    high_vulnerability = sovi_rating_clean == "very high"
+  )
+
+# Define high hurricane risk as the top quartile in this analysis sample.
+hurricane_risk_cutoff <- quantile(
+  part2_priority$HRCN_RISKS,
+  probs = 0.75,
+  na.rm = TRUE,
+  names = FALSE
+)
+
+part2_priority <- part2_priority |>
+  mutate(
+    high_hurricane_risk = HRCN_RISKS >= hurricane_risk_cutoff,
+    priority_group = case_when(
+      is.na(SOVI_RATNG) | is.na(HRCN_RISKS) ~ NA_character_,
+      high_vulnerability & high_hurricane_risk ~ "High vulnerability / High hurricane risk",
+      high_vulnerability & !high_hurricane_risk ~ "High vulnerability / Lower hurricane risk",
+      !high_vulnerability & high_hurricane_risk ~ "Lower vulnerability / High hurricane risk",
+      TRUE ~ "Lower vulnerability / Lower hurricane risk"
+    )
+  )
+
+priority_cutoffs <- tibble(
+  measure = c("High social vulnerability", "High hurricane risk"),
+  definition = c(
+    "FEMA SOVI_RATNG = Very High",
+    paste0("HRCN_RISKS at or above the 75th percentile (", round(hurricane_risk_cutoff, 2), ")")
+  )
+)
+
+kable(priority_cutoffs, caption = "Definitions used for county prioritization")
+
+priority_group_summary <- part2_priority |>
+  filter(!is.na(priority_group)) |>
+  count(priority_group, name = "counties") |>
+  mutate(
+    percent = counties / sum(counties) * 100
+  ) |>
+  arrange(desc(counties))
+
+kable(
+  priority_group_summary,
+  digits = 1,
+  caption = "Counties by social vulnerability and hurricane-risk group"
+)
+
+ggplot(
+  priority_group_summary,
+  aes(x = reorder(priority_group, counties), y = counties)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "County Counts by Vulnerability and Hurricane Risk",
+    x = NULL,
+    y = "Number of counties"
+  )
+```
+
+## 10.1 Counties with both high vulnerability and high hurricane risk
+
+These counties are the overlap group that may warrant closer review for preparedness, evacuation planning, and recovery-resource planning. This list is a starting point for discussion; local conditions and additional evidence should inform actual funding decisions.
+
+```{r high-high-counties}
+high_priority_counties <- part2_priority |>
+  filter(priority_group == "High vulnerability / High hurricane risk") |>
+  select(
+    STCOFIPS,
+    county_name,
+    STATEABBRV,
+    SOVI_RATNG,
+    SOVI_SCORE,
+    HRCN_RISKS,
+    HRCN_AFREQ,
+    HRCN_EXPB
+  ) |>
+  arrange(desc(HRCN_RISKS))
+
+kable(
+  high_priority_counties,
+  digits = 2,
+  caption = "Counties with very high social vulnerability and top-quartile hurricane risk"
+)
+
+cat("Number of high-high priority counties:", nrow(high_priority_counties))
+```
+
+## 10.2 Compare average risk across vulnerability groups
+
+This table helps show whether counties with higher FEMA social vulnerability ratings also tend to have higher hurricane risk in this sample. It is descriptive and does not establish that vulnerability causes hurricane risk.
+
+```{r risk-by-sovi}
+risk_by_sovi <- part2_priority |>
+  filter(!is.na(SOVI_RATNG), !is.na(HRCN_RISKS)) |>
+  mutate(
+    SOVI_RATNG = factor(
+      str_to_title(str_squish(as.character(SOVI_RATNG))),
+      levels = c("Very Low", "Relatively Low", "Relatively Moderate", "Relatively High", "Very High"),
+      ordered = TRUE
+    )
+  ) |>
+  group_by(SOVI_RATNG) |>
+  summarise(
+    counties = n(),
+    average_hurricane_risk = mean(HRCN_RISKS, na.rm = TRUE),
+    median_hurricane_risk = median(HRCN_RISKS, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(SOVI_RATNG)
+
+kable(
+  risk_by_sovi,
+  digits = 2,
+  caption = "Hurricane risk by FEMA social vulnerability rating"
+)
+
+ggplot(
+  part2_priority |> filter(!is.na(SOVI_RATNG)),
+  aes(
+    x = factor(
+      str_to_title(str_squish(as.character(SOVI_RATNG))),
+      levels = c("Very Low", "Relatively Low", "Relatively Moderate", "Relatively High", "Very High"),
+      ordered = TRUE
+    ),
+    y = HRCN_RISKS
+  )
+) +
+  geom_boxplot() +
+  labs(
+    title = "County Hurricane Risk Across Social Vulnerability Ratings",
+    x = "FEMA Social Vulnerability Rating",
+    y = "FEMA Hurricane Risk Score"
+  )
+```
+
+# 11. Save model results and the merged dataset
+
+The output files are saved in the same folder as the input CSV files. This makes the results easy to share with teammates.
+
+```{r export-results}
+write.csv(
+  part2,
+  file.path(data_dir, "part2_hurricane_modeling_data.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  model_comparison,
+  file.path(data_dir, "part2_model_comparison.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  rf_importance,
+  file.path(data_dir, "part2_random_forest_importance.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  xgb_importance,
+  file.path(data_dir, "part2_xgboost_importance.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  priority_group_summary,
+  file.path(data_dir, "part2_priority_group_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  high_priority_counties,
+  file.path(data_dir, "part2_high_priority_counties.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  risk_by_sovi,
+  file.path(data_dir, "part2_risk_by_social_vulnerability.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  prediction_plot_data,
+  file.path(data_dir, "part2_test_predictions.csv"),
+  row.names = FALSE
+)
+
+cat("Saved modeling dataset, model outputs, and county-prioritization files to:", data_dir)
+```
+
+
+# 12. Interpretation guide
+
+Use the results above to write the project findings. In particular, address:
+
+1. **Predictive performance:** Which model has the lowest test RMSE? How much better is it than the naive mean benchmark?
+2. **Value of community data:** Compare the community-only linear model with the combined linear model. How much do FEMA hurricane frequency and exposure variables improve prediction?
+3. **Biggest risk drivers:** Which predictors have the highest random forest importance? Do these results align with the correlation analysis?
+4. **Practical usefulness:** Are the model's errors small enough to be useful for comparing county-level risk? Explain what the RMSE means in risk-score points.
+5. **Cross-part prioritization:** How many counties have both Very High social vulnerability and top-quartile hurricane risk? Which counties appear in the exported high-high list? How could this screening list inform preparedness discussions?
+6. **Limitations:** The FEMA risk score is an index, not a direct probability of a hurricane occurring. FEMA hazard/exposure variables are closely related to the risk score, so strong performance from the combined model is not independent evidence that community characteristics alone can predict hurricane risk. ACS estimates are county-level estimates and may have sampling error. Missing ACS values are imputed using training-set medians.
+
+**Important modeling note:** Do not add any `_EAL` or `EAL` variables as predictors. Expected Annual Loss is used in the construction of FEMA risk scores, so including it would create target leakage.
+
+# Appendix: Files needed by teammates
+
+Share these three input files with Madelyn:
+
+- `nri_county_trimmed.csv`
+- `census_data.csv`
+- `acs_community_data.csv`
+
+Madelyn can run this report without an API key. She only needs to set `data_dir` to the folder where she stores the three CSV files.
