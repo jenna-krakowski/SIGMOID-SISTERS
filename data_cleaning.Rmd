@@ -1,0 +1,419 @@
+---
+title: "BZAN 542 - Expected Annual Loss and Social Vulnerability"
+output: html_document
+params:
+  export: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+```
+
+## Load and validate the data
+
+Each row represents a county or county equivalent. Read the county FIPS as text to keep leading zeros. Count recorded zeros separately from missing values.
+
+```{r load}
+NRI <- read.csv("nri_county_trimmed.csv", colClasses = c("STCOFIPS" = "character"),
+                check.names = FALSE, na.strings = c("", "NA"), strip.white = TRUE)
+CENSUS <- read.csv("census_data.csv", colClasses = c("STCOFIPS" = "character"),
+                   check.names = FALSE, na.strings = c("", "NA"), strip.white = TRUE)
+
+for (ids in list(NRI$STCOFIPS, CENSUS$STCOFIPS)) {
+  stopifnot(!anyNA(ids), all(nchar(ids) == 5), all(grepl("^[0-9]{5}$", ids)),
+            !anyDuplicated(ids))
+}
+dim(NRI)
+dim(CENSUS)
+stopifnot(nrow(NRI) == 3231, nrow(CENSUS) == 3222)
+
+profile <- function(DATA) {
+  data.frame(
+    column = names(DATA),
+    missing = colSums(is.na(DATA)),
+    zeros = sapply(DATA, function(x) {
+      if (is.numeric(x)) sum(x == 0, na.rm = TRUE) else NA_integer_
+    }),
+    row.names = NULL
+  )
+}
+
+eal_fields <- c("EAL_VALT", "EAL_VALB", "EAL_VALPE", "EAL_VALA")
+key_fields <- c("STCOFIPS", "SOVI_RATNG", "SOVI_SCORE", "BUILDVALUE", "AGRIVALUE",
+                "AREA", eal_fields, "EAL_VALP")
+profile(NRI[key_fields])
+profile(CENSUS)
+```
+
+## Join FEMA and Census
+
+Keep all FEMA rows in the join. Census reports Connecticut's nine planning regions (09110 through 09190) as county equivalents, while FEMA uses the eight historical counties (09001 through 09015). The ten unmatched territory records also lack a social vulnerability rating.
+
+```{r join}
+PART1 <- NRI %>%
+  left_join(mutate(CENSUS, in_census = TRUE), by = "STCOFIPS") %>%
+  mutate(in_census = !is.na(in_census))
+
+unmatched <- PART1 %>% filter(!in_census) %>% select(STCOFIPS, STATE, COUNTY, SOVI_RATNG)
+census_only <- CENSUS %>% anti_join(NRI, by = "STCOFIPS") %>% select(STCOFIPS)
+table(PART1$in_census)
+unmatched
+census_only
+
+ct_counties <- sprintf("%05d", seq(9001, 9015, by = 2))
+ct_regions <- sprintf("%05d", seq(9110, 9190, by = 10))
+stopifnot(nrow(PART1) == 3231, sum(PART1$in_census) == 3213,
+          nrow(unmatched) == 18, setequal(census_only$STCOFIPS, ct_regions))
+joined_dim <- dim(PART1)
+```
+
+## Clean the analysis fields
+
+Exclude the ten rows with unavailable ratings and missing scores. Keep rated Connecticut counties in the analysis. Store the rating as an ordered factor for summaries and as an unordered factor with Very Low first for treatment contrasts in a later regression. Verify the ratings against the score cutoffs.
+
+```{r ratings}
+ratings <- c("Very Low", "Relatively Low", "Relatively Moderate",
+             "Relatively High", "Very High")
+table(PART1$SOVI_RATNG, useNA = "ifany")
+unrated <- PART1 %>% filter(SOVI_RATNG == "Data Unavailable")
+stopifnot(nrow(unrated) == 10, all(is.na(unrated$SOVI_SCORE)), all(!unrated$in_census))
+
+PART1 <- PART1 %>%
+  filter(SOVI_RATNG != "Data Unavailable") %>%
+  mutate(SOVI_RATNG = factor(SOVI_RATNG, levels = ratings, ordered = TRUE),
+         SOVI_RATNG_f = factor(as.character(SOVI_RATNG), levels = ratings))
+stopifnot(nrow(PART1) == 3221, sum(PART1$in_census) == 3213,
+          setequal(PART1$STCOFIPS[!PART1$in_census], ct_counties),
+          !anyNA(PART1$SOVI_RATNG))
+
+score_rating <- cut(PART1$SOVI_SCORE, breaks = c(0, 20, 40, 60, 80, 100),
+                    labels = ratings, include.lowest = TRUE)
+table(Reported = PART1$SOVI_RATNG, From_score = score_rating, useNA = "ifany")
+stopifnot(!anyNA(score_rating), all(as.character(score_rating) == as.character(PART1$SOVI_RATNG)))
+```
+
+Keep the county building value, agricultural value, area, and all supplied hazard frequency, event count, and exposure fields for denominators and possible controls. Use the monetary population-equivalence loss `EAL_VALPE` in the county dollar comparisons and remove the county population-loss field `EAL_VALP`. Hazard-specific `_EALP` fields retain their units of people.
+
+Check source losses for negatives before deriving new columns. Convert non-finite numeric values to missing.
+
+```{r loss-values}
+loss_fields <- grep("^EAL_VAL|^[A-Z]{4}_EAL(B|P|PE|T)$", names(NRI), value = TRUE)
+stopifnot(all(sapply(NRI[loss_fields], is.numeric)))
+negative_losses <- sapply(NRI[loss_fields], function(x) sum(x < 0, na.rm = TRUE))
+if (any(negative_losses > 0)) {
+  stop("Negative loss in: ", paste(names(negative_losses)[negative_losses > 0], collapse = ", "))
+}
+
+nonfinite <- sapply(PART1[sapply(PART1, is.numeric)], function(x) sum(is.infinite(x) | is.nan(x)))
+nonfinite[nonfinite > 0]
+PART1 <- PART1 %>%
+  mutate(across(where(is.numeric), ~ replace(.x, !is.finite(.x), NA))) %>%
+  select(-EAL_VALP)
+
+context_fields <- grep("_(AFREQ|EVNTS|EXP_AREA|EXPB|EXPP|EXPPE|EXPT)$",
+                       names(NRI), value = TRUE)
+stopifnot(all(c("BUILDVALUE", "AGRIVALUE", "AREA", context_fields) %in% names(PART1)))
+```
+
+For hazards with an agricultural loss component, derive that loss as the residual after subtracting building and population-equivalence losses from the hazard total. Floor the residual at zero to handle rounding. Drought loss is entirely agricultural. In the county reconciliation, an inapplicable hazard contributes zero.
+
+```{r loss-identities}
+ag_hazards <- c("CWAV", "HAIL", "HWAV", "HRCN", "RFLD", "SWND", "TRND", "WFIR", "WNTW")
+for (hazard in ag_hazards) {
+  PART1[[paste0(hazard, "_EALA")]] <- pmax(
+    PART1[[paste0(hazard, "_EALT")]] - PART1[[paste0(hazard, "_EALB")]] -
+      PART1[[paste0(hazard, "_EALPE")]], 0)
+}
+PART1$DRGT_EALA <- PART1$DRGT_EALT
+ag_fields <- paste0(c(ag_hazards, "DRGT"), "_EALA")
+ag_error <- abs(rowSums(PART1[ag_fields], na.rm = TRUE) - PART1$EAL_VALA)
+total_error <- abs(PART1$EAL_VALT - (PART1$EAL_VALB + PART1$EAL_VALPE + PART1$EAL_VALA))
+
+identity_check <- data.frame(
+  check = c("County total versus county loss components",
+            "County agricultural loss versus derived hazard losses"),
+  counties = nrow(PART1),
+  missing = c(sum(is.na(total_error)), sum(is.na(ag_error))),
+  outside_one_dollar = c(sum(total_error > 1, na.rm = TRUE), sum(ag_error > 1, na.rm = TRUE)),
+  max_difference_dollars = c(max(total_error), max(ag_error))
+)
+identity_check
+stopifnot(all(identity_check$missing == 0), all(identity_check$outside_one_dollar == 0))
+```
+
+A missing hazard loss indicates that the hazard does not apply to the county. The `_present` flag uses availability of the hazard total. Keep original missing values for comparing magnitudes among counties where a hazard applies. Use the `_z` copies for calculating the share of all rated counties with any loss, counting inapplicable hazards as zero in that calculation.
+
+```{r hazard-losses}
+hazard_totals <- grep("^[A-Z]{4}_EALT$", names(PART1), value = TRUE)
+hazards <- sub("_EALT$", "", hazard_totals)
+hazard_losses <- grep("^[A-Z]{4}_EAL(A|B|P|PE|T)$", names(PART1), value = TRUE)
+
+for (hazard in hazards) {
+  PART1[[paste0(hazard, "_present")]] <- !is.na(PART1[[paste0(hazard, "_EALT")]])
+}
+for (field in hazard_losses) {
+  present <- PART1[[paste0(substr(field, 1, 4), "_present")]]
+  stopifnot(all(!is.na(PART1[[field]]) == present))
+  PART1[[paste0(field, "_z")]] <- replace(PART1[[field]], !present, 0)
+}
+```
+
+The supplied Hispanic/Latino count equals total population on every Census row. Drop that duplicate field because it provides no usable Hispanic/Latino measure. Check the sex and age totals on the full Census file. Use total population as the denominator for age and race shares, and occupied housing units as the denominator for renter share.
+
+```{r census-checks}
+age_fields <- c("UNDER_5_POP", "5_9_POP", "10_14_POP", "15_19_POP", "20_24_POP",
+                "25_34_POP", "35_44_POP", "45_54_POP", "55_59_POP", "60_64_POP",
+                "65_74_POP", "75_84_POP", "85_PLUS_POP")
+census_equal <- data.frame(
+  Hispanic_equals_total = CENSUS$HISPANIC_LATINO_POP == CENSUS$TOT_POP,
+  sex_counts_equal_total = CENSUS$MALE_POP + CENSUS$FEMALE_POP == CENSUS$TOT_POP,
+  age_counts_equal_total = rowSums(CENSUS[age_fields]) == CENSUS$TOT_POP
+)
+data.frame(check = names(census_equal), equal = colSums(census_equal, na.rm = TRUE),
+           missing = colSums(is.na(census_equal)), rows = nrow(CENSUS))
+stopifnot(all(as.matrix(census_equal)))
+
+PART1 <- PART1 %>%
+  select(-HISPANIC_LATINO_POP) %>%
+  mutate(share_65plus = if_else(TOT_POP > 0, (`65_74_POP` + `75_84_POP` + `85_PLUS_POP`) / TOT_POP, NA_real_),
+         renter_share = if_else(OCCUPIED_HOUSING_UNITS > 0,
+                               RENTER_OCCUPIED_HOUSING_UNITS / OCCUPIED_HOUSING_UNITS, NA_real_),
+         white_share = if_else(TOT_POP > 0, WHITE_POP / TOT_POP, NA_real_),
+         black_share = if_else(TOT_POP > 0, BLACK_POP / TOT_POP, NA_real_),
+         native_share = if_else(TOT_POP > 0, NATIVE_POP / TOT_POP, NA_real_),
+         asian_share = if_else(TOT_POP > 0, ASIAN_POP / TOT_POP, NA_real_),
+         other_race_share = if_else(TOT_POP > 0, OTHER_RACE_POP / TOT_POP, NA_real_))
+```
+
+Divide building and total loss by building value, agricultural loss by agricultural value, and monetized population loss by population. Assign a missing ratio when its denominator is zero or unavailable. A county with positive agricultural value can have a recorded zero agricultural loss.
+
+```{r ratios}
+PART1 <- PART1 %>%
+  mutate(B_ratio = if_else(BUILDVALUE > 0, EAL_VALB / BUILDVALUE, NA_real_),
+         T_ratio = if_else(BUILDVALUE > 0, EAL_VALT / BUILDVALUE, NA_real_),
+         A_ratio = if_else(AGRIVALUE > 0, EAL_VALA / AGRIVALUE, NA_real_),
+         PE_per_capita = if_else(TOT_POP > 0, EAL_VALPE / TOT_POP, NA_real_))
+
+filter(PART1, AGRIVALUE == 0) %>% select(STCOFIPS, STATE, COUNTY, AGRIVALUE, A_ratio) %>%
+  as_tibble() %>% print(n = Inf)
+profile(PART1[c("B_ratio", "T_ratio", "A_ratio", "PE_per_capita")])
+```
+
+Take plain base-10 logs of the strictly positive losses. For any logged field with recorded zeros, add 1% of its smallest positive value to every observed value before taking the log, as in the lecture NRI example. Use the original hazard losses so the logs preserve structural missingness. The offsets are printed here and stored with the RDS and in the dictionary descriptions.
+
+```{r logs}
+positive_fields <- c("EAL_VALT", "EAL_VALB", "EAL_VALPE")
+stopifnot(all(sapply(PART1[positive_fields], function(x) all(is.finite(x) & x > 0))))
+log_fields <- c(eal_fields, "B_ratio", "T_ratio", "A_ratio", "PE_per_capita", hazard_losses)
+log_offsets <- setNames(numeric(length(log_fields)), log_fields)
+for (field in log_fields) {
+  x <- PART1[[field]]
+  if (any(x == 0, na.rm = TRUE)) {
+    stopifnot(any(x > 0, na.rm = TRUE))
+    log_offsets[field] <- 0.01 * min(x[x > 0], na.rm = TRUE)
+  }
+  PART1[[paste0("log10_", field)]] <- log10(x + log_offsets[field])
+}
+attr(PART1, "log10_offsets") <- log_offsets
+data.frame(column = log_fields, offset = unname(log_offsets))
+```
+
+## What changed?
+
+```{r dimensions}
+knitr::kable(data.frame(
+  stage = c("Raw FEMA", "Raw Census", "Left join", "Rated counties, analysis-ready"),
+  rows = c(nrow(NRI), nrow(CENSUS), joined_dim[1], nrow(PART1)),
+  columns = c(ncol(NRI), ncol(CENSUS), joined_dim[2], ncol(PART1)),
+  change = c("Source loss, risk, vulnerability, and exposure data",
+             "Source population and housing data",
+             "Added Census fields and a join flag while keeping all FEMA rows",
+             paste("Excluded 10 unrated territories, the county people-loss field, and the duplicate Census count.",
+                   "Added factor contrasts, hazard loss residuals, applicability flags, zero-filled copies,",
+                   "Census shares, normalized losses, and logs."))
+))
+```
+
+These counts show what changes when the ten unrated territory records are excluded. Hazard nonzero counts refer to total loss dollars for that hazard.
+
+```{r raw-and-rated}
+compare_fields <- c(key_fields, hazard_totals)
+RAW_counts <- profile(NRI[compare_fields])
+rated_fields <- compare_fields[compare_fields %in% names(PART1)]
+RATED_counts <- profile(PART1[rated_fields])
+RATED_counts <- left_join(data.frame(column = compare_fields), RATED_counts, by = "column")
+
+data.frame(column = compare_fields,
+           raw_3231_missing = RAW_counts$missing,
+           raw_3231_zeros = RAW_counts$zeros,
+           rated_3221_missing = RATED_counts$missing,
+           rated_3221_zeros = RATED_counts$zeros)
+data.frame(hazard = hazards,
+           raw_3231_nonzero = sapply(NRI[hazard_totals], function(x) sum(x > 0, na.rm = TRUE)),
+           rated_3221_nonzero = sapply(PART1[hazard_totals], function(x) sum(x > 0, na.rm = TRUE)),
+           row.names = NULL)
+```
+
+## Expected annual loss by vulnerability rating
+
+```{r group-summary}
+table(PART1$SOVI_RATNG)
+PART1 %>%
+  group_by(SOVI_RATNG) %>%
+  summarize(counties = n(), median_dollars = median(EAL_VALT),
+            IQR_dollars = IQR(EAL_VALT), mean_dollars = mean(EAL_VALT),
+            median_log10 = median(log10_EAL_VALT), IQR_log10 = IQR(log10_EAL_VALT),
+            mean_log10 = mean(log10_EAL_VALT)) %>%
+  as.data.frame()
+```
+
+County total expected annual loss has a long right tail on the dollar scale. The log scale makes the distribution across counties easier to see.
+
+```{r loss-histograms, fig.width=9, fig.height=4}
+old_par <- par(mfrow = c(1, 2))
+hist(PART1$EAL_VALT, breaks = 30, col = "lightblue",
+     main = "Total expected annual loss", xlab = "Dollars")
+hist(PART1$log10_EAL_VALT, breaks = 30, col = "lightblue",
+     main = "Log of total expected annual loss", xlab = "Log10 dollars")
+par(old_par)
+```
+
+## How common are hazard losses?
+
+The denominator for percentages is all 3,221 rated counties. The zero percentage includes recorded zeros and counties where the hazard does not apply. The table shows those two counts so readers can distinguish them. A hazard is marked sparse when fewer than 15% of rated counties have positive total loss for that hazard.
+
+```{r hazard-coverage}
+loss_types <- c(A = "Agriculture (dollars)", B = "Buildings (dollars)",
+                P = "Population (people)", PE = "Population equivalence (dollars)",
+                T = "Total (dollars)")
+HAZARD_summary <- bind_rows(lapply(hazard_losses, function(field) {
+  hazard <- substr(field, 1, 4)
+  x <- PART1[[field]]
+  z <- PART1[[paste0(field, "_z")]]
+  data.frame(
+    hazard = hazard,
+    loss_type = unname(loss_types[sub("^[A-Z]{4}_EAL", "", field)]),
+    applies = sum(PART1[[paste0(hazard, "_present")]]),
+    structural_NA = sum(is.na(x)),
+    recorded_zero = sum(x == 0, na.rm = TRUE),
+    nonzero = sum(z > 0),
+    percent_zero = 100 * mean(z == 0),
+    sparse_hazard = mean(PART1[[paste0(hazard, "_EALT_z")]] > 0) < 0.15
+  )
+}))
+knitr::kable(HAZARD_summary, digits = 2)
+```
+
+### Limitations and additional data
+
+- The supplied population and housing data lack several social vulnerability components, including income, disability, education, and language. The Hispanic/Latino count is unusable.
+- Building age, mitigation spending, and insured and uninsured losses are unavailable in the supplied inputs.
+- The county scale hides differences within counties, and eight Connecticut counties lack matching Census covariates.
+- FEMA EAL is a modeled annual estimate. Observed losses would allow a comparison with the estimates.
+
+## Export
+
+Set `export: true` under `params` in the header or render with
+`rmarkdown::render("data_cleaning.Rmd", params = list(export = TRUE))`.
+The RDS preserves character FIPS and both SOVI factors. Read the CSV with
+`colClasses = c("STCOFIPS" = "character")` to preserve leading zeros.
+
+```{r export}
+if (isTRUE(params$export)) {
+  nri_descriptions <- c(
+    STATE = "State or territory name", STATEABBRV = "State or territory abbreviation",
+    COUNTY = "County or county equivalent name", STCOFIPS = "Five-digit county FIPS code",
+    BUILDVALUE = "County building value in dollars", AGRIVALUE = "County agricultural value in dollars",
+    AREA = "County area in square miles", RISK_VALUE = "Overall FEMA risk index value",
+    RISK_SCORE = "Overall FEMA risk index score", EAL_VALT = "Total expected annual loss in dollars",
+    EAL_VALB = "Building expected annual loss in dollars",
+    EAL_VALPE = "Monetized population-equivalence expected annual loss in dollars",
+    EAL_VALA = "Agricultural expected annual loss in dollars",
+    SOVI_SCORE = "Social vulnerability score",
+    SOVI_RATNG = "Social vulnerability rating, ordered from Very Low to Very High"
+  )
+  hazard_descriptions <- c(
+    EVNTS = "Recorded hazard events", AFREQ = "Annualized hazard frequency",
+    EXP_AREA = "Hazard exposure area in square miles", EXPB = "Building exposure in dollars",
+    EXPP = "Population exposure in people", EXPPE = "Population-equivalence exposure in dollars",
+    EXPT = "Total exposure in dollars", EALB = "Building expected annual loss in dollars",
+    EALP = "Population expected annual loss in people",
+    EALPE = "Population-equivalence expected annual loss in dollars",
+    EALT = "Total expected annual loss in dollars", RISKS = "FEMA hazard risk score"
+  )
+  hazard_names <- setNames(c("Avalanche", "Coastal flooding", "Cold wave", "Drought",
+                             "Earthquake", "Hail", "Heat wave", "Hurricane", "Ice storm",
+                             "Landslide", "Lightning", "Riverine flooding", "Strong wind",
+                             "Tornado", "Tsunami", "Volcanic activity", "Wildfire", "Winter weather"),
+                           c("AVLN", "CFLD", "CWAV", "DRGT", "ERQK", "HAIL", "HWAV", "HRCN",
+                             "ISTM", "LNDS", "LTNG", "RFLD", "SWND", "TRND", "TSUN", "VLCN",
+                             "WFIR", "WNTW"))
+  for (field in setdiff(names(NRI), c(names(nri_descriptions), "EAL_VALP"))) {
+    nri_descriptions[field] <- paste(hazard_names[[substr(field, 1, 4)]],
+                                    hazard_descriptions[[substring(field, 6)]], sep = " - ")
+  }
+
+  census_descriptions <- c(
+    TOT_POP = "Total population", MALE_POP = "Male population", FEMALE_POP = "Female population",
+    setNames(paste("Population age", c("under 5", "5 to 9", "10 to 14", "15 to 19",
+              "20 to 24", "25 to 34", "35 to 44", "45 to 54", "55 to 59", "60 to 64",
+              "65 to 74", "75 to 84", "85 or older")), age_fields),
+    MEDIAN_AGE = "Median age in years", WHITE_POP = "White population",
+    BLACK_POP = "Black population", NATIVE_POP = "Native population",
+    ASIAN_POP = "Asian population", OTHER_RACE_POP = "Population in the supplied other-race category",
+    TOTAL_HOUSING_UNITS = "Total housing units", OCCUPIED_HOUSING_UNITS = "Occupied housing units",
+    OWNER_OCCUPIED_HOUSING_UNITS = "Owner-occupied housing units",
+    RENTER_OCCUPIED_HOUSING_UNITS = "Renter-occupied housing units"
+  )
+
+  derived_descriptions <- c(
+    in_census = "Whether the county FIPS matched a Census row",
+    SOVI_RATNG_f = "Unordered social vulnerability rating with Very Low as the first level",
+    share_65plus = "Population aged 65 or older divided by total population",
+    renter_share = "Renter-occupied housing units divided by occupied housing units",
+    white_share = "White population divided by total population",
+    black_share = "Black population divided by total population",
+    native_share = "Native population divided by total population",
+    asian_share = "Asian population divided by total population",
+    other_race_share = "Supplied other-race population divided by total population",
+    B_ratio = "County building expected annual loss divided by county building value",
+    T_ratio = "County total expected annual loss divided by county building value",
+    A_ratio = "County agricultural expected annual loss divided by positive county agricultural value",
+    PE_per_capita = "Monetized population-equivalence expected annual loss per resident",
+    setNames(paste(hazard_names[ag_hazards],
+                   "agricultural loss in dollars from the nonnegative residual of total minus building and monetized population loss"),
+             paste0(ag_hazards, "_EALA")),
+    DRGT_EALA = "Drought agricultural loss in dollars, equal to drought total loss",
+    setNames(paste(hazard_names[hazards], "applies based on availability of hazard total expected annual loss"),
+             paste0(hazards, "_present")),
+    setNames(paste(hazard_losses, "with structural missingness represented as zero"),
+             paste0(hazard_losses, "_z")),
+    setNames(paste("Base-10 log of", log_fields, "with offset", format(log_offsets, trim = TRUE, digits = 15)),
+             paste0("log10_", log_fields))
+  )
+  descriptions <- c(nri_descriptions, census_descriptions, derived_descriptions)
+  fields <- names(PART1)
+  DICTIONARY <- data.frame(
+    name = fields,
+    type = sapply(PART1, function(x) class(x)[1]),
+    source = ifelse(fields %in% names(nri_descriptions), "FEMA NRI",
+                    ifelse(fields %in% names(census_descriptions), "Supplied Census", "Derived")),
+    description = unname(descriptions[fields]),
+    row.names = NULL
+  )
+  stopifnot(!anyDuplicated(names(descriptions)), !anyNA(DICTIONARY$description))
+
+  dir.create("outputs", showWarnings = FALSE)
+  write.csv(PART1, "outputs/part1_clean.csv", row.names = FALSE, na = "")
+  saveRDS(PART1, "outputs/part1_clean.rds")
+  write.csv(DICTIONARY, "outputs/part1_data_dictionary.csv", row.names = FALSE)
+
+  SAVED <- readRDS("outputs/part1_clean.rds")
+  stopifnot(is.character(SAVED$STCOFIPS), is.ordered(SAVED$SOVI_RATNG),
+            is.factor(SAVED$SOVI_RATNG_f), !is.ordered(SAVED$SOVI_RATNG_f),
+            identical(levels(SAVED$SOVI_RATNG), ratings),
+            identical(levels(SAVED$SOVI_RATNG_f), ratings),
+            identical(attr(SAVED, "log10_offsets"), log_offsets))
+}
+```
