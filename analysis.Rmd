@@ -1,0 +1,1200 @@
+---
+title: "BZAN 542 - Expected Annual Loss and Social Vulnerability"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Keep accidental default-device drawing off disk. Figure chunks use knitr's device.
+options(device = function(...) grDevices::pdf(file = NULL, ...))
+library(dplyr)
+library(ggplot2)
+set.seed(42)
+```
+
+## Load the county data
+
+Each row is a rated county or county equivalent. This analysis uses the cleaned RDS from the preparation notebook. Both outcomes in this section are available for all rated counties, including the eight Connecticut counties without matching Census data.
+
+```{r load}
+if (!file.exists("outputs/part1_clean.rds")) {
+  stop("Run data_cleaning.Rmd with params = list(export = TRUE) to create outputs/part1_clean.rds.")
+}
+PART1 <- readRDS("outputs/part1_clean.rds")
+ratings <- c("Very Low", "Relatively Low", "Relatively Moderate", "Relatively High", "Very High")
+rating_counts <- table(PART1$SOVI_RATNG)
+rating_counts
+table(PART1$in_census)
+
+ct_counties <- sprintf("%05d", seq(9001, 9015, by = 2))
+score_rating <- cut(PART1$SOVI_SCORE, c(0, 20, 40, 60, 80, 100),
+                    labels = ratings, include.lowest = TRUE)
+stopifnot(nrow(PART1) == 3221, is.character(PART1$STCOFIPS),
+          !anyNA(PART1$STCOFIPS), !anyDuplicated(PART1$STCOFIPS),
+          sum(PART1$in_census) == 3213,
+          setequal(PART1$STCOFIPS[!PART1$in_census], ct_counties),
+          all(is.na(PART1$TOT_POP) == !PART1$in_census),
+          is.ordered(PART1$SOVI_RATNG), identical(levels(PART1$SOVI_RATNG), ratings),
+          is.factor(PART1$SOVI_RATNG_f), !is.ordered(PART1$SOVI_RATNG_f),
+          identical(levels(PART1$SOVI_RATNG_f), ratings),
+          all(as.character(PART1$SOVI_RATNG) == as.character(score_rating)),
+          all(as.integer(rating_counts) == c(629, 628, 630, 644, 690)),
+          all(abs(PART1$EAL_VALT - (PART1$EAL_VALB + PART1$EAL_VALPE + PART1$EAL_VALA)) <= 1),
+          all(PART1$EAL_VALT > 0), all(PART1$T_ratio > 0))
+PART1 <- PART1 %>%
+  mutate(log10_EAL_VALT = log10(EAL_VALT), log10_T_ratio = log10(T_ratio))
+```
+
+```{r exports}
+dir.create("outputs/figures", showWarnings = FALSE)
+dir.create("outputs/tables", showWarnings = FALSE)
+
+save_table <- function(DATA, filename) {
+  write.csv(DATA, file.path("outputs/tables", filename), row.names = FALSE)
+}
+
+save_figure <- function(PLOT, filename, width, height) {
+  ggsave(file.path("outputs/figures", filename), plot = PLOT,
+         width = width, height = height, dpi = 300, bg = "white")
+}
+
+save_base_figure <- function(draw, filename, width, height) {
+  path <- file.path("outputs/figures", filename)
+  png(path, width = width, height = height, units = "in", res = 300)
+  tryCatch(draw(), finally = invisible(dev.off()))
+  # Quartz writes the requested pixel dimensions but omits print resolution.
+  if (identical(getOption("bitmapType"), "quartz") && nzchar(Sys.which("sips"))) {
+    status <- system2("sips", c("-s", "dpiWidth", "300", "-s", "dpiHeight", "300", shQuote(path)),
+                      stdout = FALSE, stderr = FALSE)
+    stopifnot(status == 0L)
+  }
+}
+```
+
+## Q1. Does total expected annual loss differ across SOVI ratings?
+
+### County losses by rating
+
+Compare total expected annual loss (EAL) in dollars and on a base-10 log scale. Also compare total loss per dollar of county building value. That ratio uses building value as a common size denominator for all components of total loss.
+
+```{r group-summary}
+GROUPS <- PART1 %>%
+  group_by(SOVI_RATNG) %>%
+  summarize(n = n(),
+            median_dollars = median(EAL_VALT), IQR_dollars = IQR(EAL_VALT),
+            mean_dollars = mean(EAL_VALT),
+            median_log10 = median(log10_EAL_VALT), IQR_log10 = IQR(log10_EAL_VALT),
+            mean_log10 = mean(log10_EAL_VALT),
+            median_ratio = median(T_ratio), IQR_ratio = IQR(T_ratio),
+            mean_ratio = mean(T_ratio)) %>%
+  as.data.frame()
+save_table(GROUPS, "q1_group_summary.csv")
+knitr::kable(GROUPS, digits = 6)
+```
+
+The mean dollar loss exceeds the median within every group because a small number of high-loss counties pull the mean upward.
+
+### Check the log-loss assumptions
+
+Use Q–Q plots and Shapiro–Wilk tests within each rating group to check the tails and shape of log loss. Compare spreads across the groups with the Fligner–Killeen test and report the largest-to-smallest sample variance ratio.
+
+```{r assumptions}
+LOG_GROUPS <- split(PART1$log10_EAL_VALT, PART1$SOVI_RATNG)
+NORMALITY <- bind_rows(lapply(names(LOG_GROUPS), function(group) {
+  x <- LOG_GROUPS[[group]]
+  test <- shapiro.test(x)
+  data.frame(group = group, n = length(x), W = unname(test$statistic),
+             p = test$p.value, variance = var(x))
+}))
+test <- fligner.test(log10_EAL_VALT ~ SOVI_RATNG, data = PART1)
+SPREAD <- data.frame(n = nrow(PART1), chi_squared = unname(test$statistic),
+                     df = unname(test$parameter), p = test$p.value,
+                     variance_ratio = max(NORMALITY$variance) / min(NORMALITY$variance))
+NORMALITY
+SPREAD
+save_table(NORMALITY, "q1_shapiro_by_rating.csv")
+save_table(SPREAD, "q1_fligner_log_total_loss.csv")
+```
+
+```{r qq-plots, fig.width=10, fig.height=6}
+plot_qq <- function() {
+  old_par <- par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+  on.exit(par(old_par))
+  for (group in names(LOG_GROUPS)) {
+    qqnorm(LOG_GROUPS[[group]], main = group, ylab = "Log10 dollars",
+           pch = 16, cex = 0.45)
+    qqline(LOG_GROUPS[[group]], col = "steelblue", lwd = 2)
+  }
+}
+plot_qq()
+save_base_figure(plot_qq, "q1_log_total_loss_qq_by_rating.png", 10, 6)
+```
+
+The log-loss Q–Q plots show departures from normality in the tails. The primary comparison uses ranks because dollar losses are skewed and group spreads can differ. Kruskal–Wallis tests for differences in rank distributions. Group medians describe typical losses alongside the test.
+
+### Compare the groups using ranks
+
+Report epsilon-squared as the tie-corrected Kruskal–Wallis statistic divided by \(n-1\). Use descriptive cutoffs of 0.01, 0.06, and 0.14 for small, moderate, and large effects. For the ten pairwise comparisons, use Wilcoxon rank-sum tests with Holm adjustment as the post-hoc fallback for Dunn's test. Signed Cliff's delta is the probability that a county in the higher rating has the larger outcome minus the probability that a county in the lower rating has the larger outcome. Ties contribute zero.
+
+```{r rank-tests}
+rank_comparison <- function(x, group) {
+  keep <- complete.cases(x, group)
+  x <- x[keep]
+  group <- droplevels(group[keep])
+  test <- kruskal.test(x ~ group)
+  effect <- unname(test$statistic) / (length(x) - 1)
+  data.frame(n = length(x), H = unname(test$statistic), df = unname(test$parameter),
+             p = test$p.value, epsilon_squared = effect,
+             magnitude = as.character(cut(effect, c(-Inf, 0.01, 0.06, 0.14, Inf),
+                                          c("negligible", "small", "moderate", "large"), right = FALSE)))
+}
+
+wilcoxon_pairs <- function(x, group) {
+  adjusted <- pairwise.wilcox.test(x, group, p.adjust.method = "holm", exact = FALSE)$p.value
+  pairs <- combn(levels(group), 2, simplify = FALSE)
+  PAIRS <- bind_rows(lapply(pairs, function(pair) {
+    lower <- x[group == pair[1] & !is.na(x)]
+    higher <- x[group == pair[2] & !is.na(x)]
+    W <- unname(wilcox.test(higher, lower, exact = FALSE)$statistic)
+    data.frame(lower = pair[1], higher = pair[2], n_lower = length(lower),
+               n_higher = length(higher), n = length(lower) + length(higher),
+               p_holm = adjusted[pair[2], pair[1]],
+               cliffs_delta = 2 * W / (length(lower) * length(higher)) - 1)
+  }))
+  list(matrix = adjusted, pairs = PAIRS)
+}
+
+Q1_KW <- bind_rows(EAL_VALT = rank_comparison(PART1$EAL_VALT, PART1$SOVI_RATNG),
+                   T_ratio = rank_comparison(PART1$T_ratio, PART1$SOVI_RATNG),
+                   .id = "outcome")
+Q1_KW
+save_table(Q1_KW, "q1_kruskal_wallis.csv")
+
+for (field in c("EAL_VALT", "T_ratio")) {
+  POSTHOC <- wilcoxon_pairs(PART1[[field]], PART1$SOVI_RATNG)
+  cat("\n", field, "- Holm-adjusted p-values\n")
+  print(POSTHOC$matrix)
+  print(POSTHOC$pairs, row.names = FALSE)
+  save_table(POSTHOC$pairs, paste0("q1_", tolower(field), "_wilcoxon_pairs.csv"))
+  save_table(data.frame(higher = rownames(POSTHOC$matrix), POSTHOC$matrix,
+                        check.names = FALSE, row.names = NULL),
+             paste0("q1_", tolower(field), "_wilcoxon_holm_matrix.csv"))
+}
+```
+
+### Trend across ratings and scores
+
+Use Spearman correlation with the five ordered rating ranks for a trend across the groups, and with the original 0–100 score for the continuous association. Use the asymptotic test because tied ranks occur. For the score correlation, resample paired county records 1,000 times and take percentile limits. These intervals treat counties as independent.
+
+```{r trend}
+scores <- list(rating = as.integer(PART1$SOVI_RATNG), score = PART1$SOVI_SCORE)
+TREND <- bind_rows(lapply(names(scores), function(predictor) {
+  test <- cor.test(scores[[predictor]], PART1$EAL_VALT, method = "spearman", exact = FALSE)
+  data.frame(predictor = predictor, n = nrow(PART1), rho = unname(test$estimate),
+             p = test$p.value)
+}))
+set.seed(42)
+boot_rho <- replicate(1000, {
+  rows <- sample.int(nrow(PART1), replace = TRUE)
+  cor(PART1$SOVI_SCORE[rows], PART1$EAL_VALT[rows], method = "spearman")
+})
+TREND$ci_lower <- c(NA_real_, unname(quantile(boot_rho, 0.025)))
+TREND$ci_upper <- c(NA_real_, unname(quantile(boot_rho, 0.975)))
+TREND
+save_table(TREND, "q1_spearman_trend.csv")
+```
+
+### Check robustness with Welch tests
+
+Welch ANOVA compares mean log losses while allowing group variances to differ. Report the ordinary descriptive eta-squared on the log scale as the between-group share of the observed sum of squares. The pairwise Welch tests report the difference in mean log loss, higher rating minus lower, with Holm-adjusted p-values.
+
+```{r welch}
+test <- oneway.test(log10_EAL_VALT ~ SOVI_RATNG, data = PART1, var.equal = FALSE)
+log_loss <- PART1$log10_EAL_VALT
+group_mean <- ave(log_loss, PART1$SOVI_RATNG)
+WELCH <- data.frame(n = nrow(PART1), F = unname(test$statistic),
+                    df_num = unname(test$parameter[1]), df_den = unname(test$parameter[2]),
+                    p = test$p.value,
+                    eta_squared = sum((group_mean - mean(log_loss))^2) /
+                      sum((log_loss - mean(log_loss))^2))
+WELCH
+save_table(WELCH, "q1_welch_anova.csv")
+
+welch_matrix <- pairwise.t.test(log_loss, PART1$SOVI_RATNG, pool.sd = FALSE,
+                                p.adjust.method = "holm")$p.value
+WELCH_PAIRS <- bind_rows(lapply(combn(ratings, 2, simplify = FALSE), function(pair) {
+  lower <- LOG_GROUPS[[pair[1]]]
+  higher <- LOG_GROUPS[[pair[2]]]
+  data.frame(lower = pair[1], higher = pair[2], n_lower = length(lower),
+             n_higher = length(higher), n = length(lower) + length(higher),
+             mean_log10_difference = mean(higher) - mean(lower),
+             p_holm = welch_matrix[pair[2], pair[1]])
+}))
+welch_matrix
+WELCH_PAIRS
+save_table(WELCH_PAIRS, "q1_welch_pairs.csv")
+```
+
+### Visual comparison
+
+The boxplots show both outcomes on log axes to make the middle half of each distribution easier to compare.
+
+```{r boxplots, fig.width=9, fig.height=4.5}
+BOX_DATA <- data.frame(
+  rating = rep(PART1$SOVI_RATNG, 2),
+  outcome = factor(rep(c("Total expected annual loss (dollars)", "Total loss per building dollar"),
+                       each = nrow(PART1)),
+                   levels = c("Total expected annual loss (dollars)", "Total loss per building dollar")),
+  value = c(PART1$EAL_VALT, PART1$T_ratio)
+)
+P <- ggplot(BOX_DATA, aes(rating, value)) +
+  geom_boxplot(fill = "lightblue", outlier.alpha = 0.25) +
+  facet_wrap(~ outcome, scales = "free_y") +
+  scale_y_log10() +
+  labs(x = "Social vulnerability rating", y = "Value on a log scale") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+P
+save_figure(P, "q1_total_loss_and_building_value_ratio_boxplots.png", 9, 4.5)
+```
+
+The raw and normalized comparisons agree that loss distributions differ across ratings and that Very High has the highest median. The ordering within the lower vulnerability groups changes with normalization. The highest group has a median of `r sprintf("$%.2f million", tail(GROUPS$median_dollars, 1) / 1e6)` in total loss and `r sprintf("%.4f dollars", tail(GROUPS$median_ratio, 1))` in total loss per building dollar.
+
+**Answer to Q1.** Total expected annual loss differs across SOVI ratings, with the highest median in the Very High group and a small overall rank effect (\(n = `r Q1_KW$n[1]`\), \(\epsilon^2 = `r round(Q1_KW$epsilon_squared[1], 3)`\), \(p = `r formatC(Q1_KW$p[1], format = "e", digits = 2)`\)).
+
+## What shape does the relationship have across the SOVI score?
+
+Use LOESS to look for changes in direction across the score. Compare a straight line with a natural cubic spline using the same counties and a preselected three degrees of freedom for the spline basis. The nested F-test checks the added spline terms. Compare the change in ordinary R², adjusted R², and AIC to judge the improvement in fit. The gray points show individual counties.
+
+```{r score-shape, fig.width=9, fig.height=4.5}
+shape_fields <- c(EAL_VALT = "Log10 total loss (dollars)",
+                  T_ratio = "Log10 total loss per building dollar")
+SHAPE <- bind_rows(lapply(names(shape_fields), function(field) {
+  DATA <- data.frame(score = PART1$SOVI_SCORE, log_loss = log10(PART1[[field]]))
+  LINEAR <- lm(log_loss ~ score, data = DATA)
+  SPLINE <- lm(log_loss ~ splines::ns(score, df = 3), data = DATA)
+  test <- anova(LINEAR, SPLINE)
+  score_grid <- 0:100
+  curve <- predict(loess(log_loss ~ score, data = DATA), newdata = data.frame(score = score_grid))
+  data.frame(outcome = field, n = nobs(SPLINE), F = test$F[2], df_num = test$Df[2],
+             df_den = df.residual(SPLINE), p = test$`Pr(>F)`[2],
+             delta_R2 = summary(SPLINE)$r.squared - summary(LINEAR)$r.squared,
+             linear_adj_R2 = summary(LINEAR)$adj.r.squared,
+             spline_adj_R2 = summary(SPLINE)$adj.r.squared,
+             linear_AIC = AIC(LINEAR), spline_AIC = AIC(SPLINE),
+             loess_min_score = score_grid[which.min(curve)],
+             loess_max_score = score_grid[which.max(curve)],
+             loess_has_increase = any(diff(curve) > 0, na.rm = TRUE),
+             loess_has_decrease = any(diff(curve) < 0, na.rm = TRUE))
+}))
+SHAPE
+save_table(SHAPE, "q1_score_linear_vs_spline.csv")
+
+SCORE_DATA <- data.frame(
+  score = rep(PART1$SOVI_SCORE, 2),
+  outcome = factor(rep(unname(shape_fields), each = nrow(PART1)), levels = unname(shape_fields)),
+  log_loss = c(PART1$log10_EAL_VALT, PART1$log10_T_ratio)
+)
+P <- ggplot(SCORE_DATA, aes(score, log_loss)) +
+  geom_point(color = "gray35", alpha = 0.17, size = 0.7) +
+  geom_smooth(method = "loess", formula = y ~ x, span = 0.75, se = FALSE,
+              color = "steelblue", linewidth = 1) +
+  facet_wrap(~ outcome, scales = "free_y") +
+  labs(x = "Social vulnerability score", y = "Log10 outcome") +
+  theme_minimal()
+P
+save_figure(P, "q1_total_loss_and_ratio_by_sovi_score_loess.png", 9, 4.5)
+```
+
+The raw-dollar relationship on the log scale is broadly increasing and approximately linear. The LOESS curve levels off and dips slightly at the highest scores, and the natural spline adds very little explanatory power. For loss per building dollar, the curve falls until a SOVI score near `r SHAPE$loess_min_score[2]` and then rises, with the steepest increases toward the high end. The spline improves fit for this ratio, so a single slope would hide the low-score dip and the stronger rise among highly vulnerable counties. Both fits explain a modest share of county-to-county variation.
+
+The normalized pattern is J-shaped, with similar levels across the lower three ratings and a rise across the top two. For raw totals, both the Wilcoxon and Welch comparisons are inconclusive for Relatively High versus Very High and for Relatively Low versus Relatively Moderate.
+
+## Line 1. Does the pattern differ by type of loss?
+
+Compare building, monetized population, and agricultural loss in dollars and against their respective denominators. The rank tests use the raw values, including genuine zeros. The curves use the cleaned base-10 logs, which include the documented offsets for outcomes with zeros. The spline comparison uses the same three degrees of freedom as Q1 and the same rows for both fits. A positive Cliff's delta means the higher vulnerability group tends to have the larger outcome.
+
+```{r loss-types}
+type_fields <- c("EAL_VALT", "T_ratio", "EAL_VALB", "B_ratio", "EAL_VALPE",
+                 "PE_per_capita", "EAL_VALA", "A_ratio")
+type_labels <- c("Total", "Building", "Population equivalence", "Agriculture")
+TYPE_DATA <- bind_rows(lapply(seq_along(type_fields), function(i) {
+  field <- type_fields[i]
+  PART1 %>%
+    transmute(outcome = field, type = type_labels[ceiling(i / 2)],
+              scale = c("Dollars", "Normalized")[(i - 1) %% 2 + 1],
+              rating = SOVI_RATNG, score = SOVI_SCORE,
+              loss = .data[[field]], log_loss = .data[[paste0("log10_", field)]]) %>%
+    filter(complete.cases(loss, log_loss, rating, score))
+}))
+TYPE_MEDIANS <- TYPE_DATA %>%
+  group_by(outcome, rating) %>%
+  summarize(n = n(), median = median(loss), .groups = "drop")
+TYPE_MEDIANS %>% as.data.frame()
+save_table(TYPE_MEDIANS, "loss_type_group_medians.csv")
+
+TYPE_SUMMARY <- bind_rows(lapply(type_fields, function(field) {
+  DATA <- filter(TYPE_DATA, outcome == field)
+  KW <- rank_comparison(DATA$loss, DATA$rating)
+  PAIRS <- wilcoxon_pairs(DATA$loss, DATA$rating)
+  if (!field %in% c("EAL_VALT", "T_ratio")) {
+    cat("\n", field, "- Holm-adjusted p-values\n")
+    print(PAIRS$matrix)
+    print(PAIRS$pairs, row.names = FALSE)
+    save_table(PAIRS$pairs, paste0("loss_type_", tolower(field), "_wilcoxon_pairs.csv"))
+    save_table(data.frame(higher = rownames(PAIRS$matrix), PAIRS$matrix,
+                          check.names = FALSE, row.names = NULL),
+               paste0("loss_type_", tolower(field), "_wilcoxon_holm_matrix.csv"))
+  }
+  medians <- filter(TYPE_MEDIANS, outcome == field)
+  assoc <- cor.test(DATA$score, DATA$loss, method = "spearman", exact = FALSE)
+  LINEAR <- lm(log_loss ~ score, data = DATA)
+  SPLINE <- lm(log_loss ~ splines::ns(score, df = 3), data = DATA)
+  comparison <- anova(LINEAR, SPLINE)
+  contrasts <- filter(PAIRS$pairs, higher == "Very High")
+  data.frame(outcome = field, KW, rho = unname(assoc$estimate), rho_p = assoc$p.value,
+             highest_median = as.character(medians$rating[which.max(medians$median)]),
+             delta_VH_RH = contrasts$cliffs_delta[contrasts$lower == "Relatively High"],
+             delta_VH_VL = contrasts$cliffs_delta[contrasts$lower == "Very Low"],
+             spline_F = comparison$F[2], spline_df_num = comparison$Df[2],
+             spline_df_den = df.residual(SPLINE), spline_p = comparison$`Pr(>F)`[2],
+             spline_added_R2 = summary(SPLINE)$r.squared - summary(LINEAR)$r.squared,
+             linear_adj_R2 = summary(LINEAR)$adj.r.squared,
+             spline_adj_R2 = summary(SPLINE)$adj.r.squared,
+             linear_AIC = AIC(LINEAR), spline_AIC = AIC(SPLINE))
+}))
+TYPE_SUMMARY$shape <- ifelse(TYPE_SUMMARY$spline_p < 0.05, "Nonlinear", "Linear fit adequate")
+knitr::kable(TYPE_SUMMARY %>% select(outcome, n, epsilon_squared, rho, highest_median,
+                                    delta_VH_RH, delta_VH_VL, shape), digits = 3)
+TYPE_SUMMARY
+save_table(TYPE_SUMMARY, "loss_type_tests_and_effect_sizes.csv")
+```
+
+```{r loss-type-curves, fig.width=8, fig.height=10}
+TYPE_DATA <- TYPE_DATA %>%
+  mutate(type = factor(type, levels = type_labels), scale = factor(scale, levels = c("Dollars", "Normalized")),
+         panel = factor(paste(type, scale), levels = as.vector(rbind(
+           paste(type_labels, "Dollars"), paste(type_labels, "Normalized")))))
+P <- ggplot(TYPE_DATA, aes(score, log_loss)) +
+  geom_point(alpha = 0.12, size = 0.45) +
+  geom_smooth(method = "loess", formula = y ~ x, span = 0.75, se = FALSE, color = "steelblue") +
+  facet_wrap(~ panel, ncol = 2, scales = "free_y") +
+  labs(x = "Social vulnerability score", y = "Log10 outcome") +
+  theme_minimal()
+P
+save_figure(P, "loss_type_raw_and_normalized_loess.png", 8, 10)
+```
+
+Building loss closely follows total loss. Building dollars rise broadly with vulnerability, while loss per building dollar has the same nonlinear pattern as normalized total loss. Monetized population loss has its highest dollar median in Relatively High, and per-capita loss has a weaker rank association with the score (\(\rho = `r round(TYPE_SUMMARY$rho[TYPE_SUMMARY$outcome == "PE_per_capita"], 3)`\)). Agricultural dollars have essentially zero Spearman correlation even though the five rating distributions differ, while loss per agricultural dollar shows a stronger positive and nonlinear relationship. The raw and normalized patterns therefore vary by loss type and by denominator.
+
+## Line 2. Which hazards and loss types are most closely associated with SOVI?
+
+The headline comparison includes all 3,221 rated counties. For this comparison, count an inapplicable hazard as zero loss. Compare it with an applicable-only analysis that keeps recorded zeros and drops structural missing values. The exposure-normalized comparison uses applicable counties with positive matching exposure. Divide building, population-equivalence, and total losses by the hazard's building, monetized population, and total exposure, respectively. For agriculture use county agricultural value as an approximate denominator, except for drought, where drought total exposure is agricultural exposure. Each grid has its own Benjamini–Hochberg family of Kruskal–Wallis tests. Total is informational because it combines loss types. Drought total and drought agriculture are the same dollars.
+
+For each derived agricultural hazard field, including drought agriculture, a positive loss is at least one cent. Values below that cutoff become zero in the analysis, while structural missing values stay missing until the all-county analysis uses the zero-filled copy. The county-level agricultural loss has no positive value below $2 and is unaffected. The sensitivity check repeats the agricultural comparisons at a $1 cutoff.
+
+```{r hazard-data}
+loss_labels <- c(B = "Building", PE = "Population equivalence", A = "Agriculture", T = "Total")
+hazard_fields <- grep("^[A-Z]{4}_EAL(B|PE|A|T)$", names(PART1), value = TRUE)
+CELLS <- data.frame(field = hazard_fields, hazard = substr(hazard_fields, 1, 4),
+                    type = sub("^...._EAL", "", hazard_fields))
+CELLS <- CELLS %>%
+  mutate(exposure = case_when(type == "A" & hazard != "DRGT" ~ "AGRIVALUE",
+                              TRUE ~ paste0(hazard, "_EXP", if_else(type == "A", "T", type))),
+         exposure_basis = if_else(exposure == "AGRIVALUE", "Approximate county agricultural value",
+                                  "Matching hazard exposure"))
+stopifnot(nrow(CELLS) == 62, length(unique(CELLS$hazard)) == 18,
+          all(CELLS$exposure %in% names(PART1)),
+          min(PART1$EAL_VALA[PART1$EAL_VALA > 0]) >= 2)
+AG_FIELDS <- CELLS$field[CELLS$type == "A"]
+AG_CUTOFFS <- bind_rows(lapply(AG_FIELDS, function(field) {
+  x <- PART1[[field]]
+  data.frame(field = field, applicable = sum(!is.na(x)),
+             positive_before_cutoff = sum(x > 0, na.rm = TRUE),
+             positive_below_cent = sum(x > 0 & x < 0.01, na.rm = TRUE),
+             positive_cent_to_dollar = sum(x >= 0.01 & x < 1, na.rm = TRUE),
+             positive_at_cent = sum(x >= 0.01, na.rm = TRUE),
+             positive_at_dollar = sum(x >= 1, na.rm = TRUE))
+}))
+AG_CUTOFFS
+save_table(AG_CUTOFFS, "hazard_agricultural_loss_cutoff_counts.csv")
+```
+
+Across the ten agricultural fields, the cent cutoff changes `r sum(AG_CUTOFFS$positive_below_cent)` positive county–hazard values to zero. The $1 cutoff changes an additional `r sum(AG_CUTOFFS$positive_cent_to_dollar)`. These counts refer to values across cells, so a county can contribute more than once.
+
+```{r hazard-functions}
+hazard_loss <- function(field, cutoff = 0.01, zero_fill = FALSE) {
+  x <- PART1[[if (zero_fill) paste0(field, "_z") else field]]
+  if (field %in% AG_FIELDS) {
+    x <- replace(x, !is.na(x) & x < cutoff, 0)
+  }
+  x
+}
+
+hazard_test <- function(x, keep) {
+  x <- x[keep]
+  group <- PART1$SOVI_RATNG[keep]
+  score <- PART1$SOVI_SCORE[keep]
+  present_groups <- droplevels(group)
+  KW <- if (nlevels(present_groups) >= 2 && length(unique(x)) >= 2) {
+    rank_comparison(x, group)
+  } else {
+    data.frame(n = length(x), H = NA_real_, df = NA_real_, p = NA_real_,
+               epsilon_squared = NA_real_, magnitude = NA_character_)
+  }
+  medians <- vapply(ratings, function(rating) median(x[group == rating]), numeric(1))
+  names(medians) <- c("median_VL", "median_RL", "median_RM", "median_RH", "median_VH")
+  rho <- if (length(unique(x)) >= 2 && length(unique(score)) >= 2) {
+    cor(x, score, method = "spearman")
+  } else {
+    NA_real_
+  }
+  data.frame(KW, n_positive = sum(x > 0), rho = rho, as.list(medians))
+}
+
+hazard_grid <- function(denominator, cutoff = 0.01) {
+  GRID <- bind_rows(lapply(seq_len(nrow(CELLS)), function(i) {
+    cell <- CELLS[i, ]
+    present <- PART1[[paste0(cell$hazard, "_present")]]
+    x <- hazard_loss(cell$field, cutoff, zero_fill = denominator == "All counties")
+    keep <- if (denominator == "All counties") rep(TRUE, length(x)) else present
+    stopifnot(all(!is.na(x[keep])))
+    if (denominator == "Positive exposure") {
+      exposure <- PART1[[cell$exposure]]
+      keep <- keep & is.finite(exposure) & exposure > 0
+      x[keep] <- x[keep] / exposure[keep]
+    }
+    data.frame(cell, denominator = denominator, hazard_test(x, keep))
+  }))
+  GRID %>%
+    mutate(p_BH = p.adjust(p, method = "BH"),
+           direction = case_when(rho > 0 ~ "Positive", rho < 0 ~ "Negative",
+                                 rho == 0 ~ "Zero", TRUE ~ "Unavailable")) %>%
+    arrange(desc(epsilon_squared), field)
+}
+
+denominators <- c("All counties", "Applicable only", "Positive exposure")
+GRIDS <- setNames(lapply(denominators, hazard_grid), denominators)
+GRID_RAW <- GRIDS[["All counties"]]
+GRID_APPLICABLE <- GRIDS[["Applicable only"]]
+GRID_NORMALIZED <- GRIDS[["Positive exposure"]]
+data.frame(denominator = denominators,
+           BH_tests = sapply(GRIDS, function(DATA) sum(!is.na(DATA$p))), row.names = NULL)
+```
+
+```{r grid-comparisons}
+sparse_hazards <- GRID_RAW %>% filter(type == "T", n_positive / n < 0.15) %>% pull(hazard)
+stopifnot(setequal(sparse_hazards, c("AVLN", "CFLD", "TSUN", "VLCN")))
+
+grid_comparison <- function(A, B) {
+  A %>% select(field, rank_a = rank, effect_a = epsilon_squared, p_BH_a = p_BH, direction_a = direction) %>%
+    left_join(B %>% select(field, rank_b = rank, effect_b = epsilon_squared,
+                           p_BH_b = p_BH, direction_b = direction), by = "field") %>%
+    mutate(rank_change = rank_b - rank_a,
+           significance_changes = (p_BH_a < 0.05) != (p_BH_b < 0.05),
+           direction_changes = direction_a != direction_b)
+}
+rank_grid <- function(DATA) {
+  DATA %>% mutate(rank = min_rank(desc(epsilon_squared)), sparse = hazard %in% sparse_hazards)
+}
+GRID_RAW <- rank_grid(GRID_RAW)
+GRID_APPLICABLE <- rank_grid(GRID_APPLICABLE)
+GRID_NORMALIZED <- rank_grid(GRID_NORMALIZED)
+APPLICABILITY <- grid_comparison(GRID_RAW, GRID_APPLICABLE)
+NORMALIZATION <- grid_comparison(GRID_RAW, GRID_NORMALIZED)
+
+save_table(GRID_RAW, "hazard_loss_grid_all_counties_headline.csv")
+save_table(GRID_APPLICABLE, "hazard_loss_grid_applicable_counties.csv")
+save_table(GRID_NORMALIZED, "hazard_loss_grid_exposure_normalized.csv")
+save_table(APPLICABILITY, "hazard_loss_applicability_sensitivity.csv")
+save_table(NORMALIZATION, "hazard_loss_exposure_rank_changes.csv")
+
+GRID_RAW %>% select(field, n, n_positive, epsilon_squared, rho, p_BH, starts_with("median_")) %>% as.data.frame()
+GRID_APPLICABLE %>% select(field, n, n_positive, epsilon_squared, rho, p_BH, starts_with("median_")) %>% as.data.frame()
+GRID_NORMALIZED %>% select(field, n, n_positive, epsilon_squared, rho, p_BH, starts_with("median_")) %>% as.data.frame()
+APPLICABILITY %>% filter(significance_changes | direction_changes) %>% as.data.frame()
+
+TOP_CELLS <- bind_rows(head(GRID_RAW, 5), head(GRID_NORMALIZED, 5)) %>%
+  select(denominator, rank, field, n, epsilon_squared, rho, p_BH, starts_with("median_"))
+knitr::kable(TOP_CELLS, digits = 6)
+save_table(TOP_CELLS, "hazard_loss_top_five_raw_and_normalized.csv")
+
+TOP_TYPES <- bind_rows(head(filter(GRID_RAW, type != "T"), 5),
+                       head(filter(GRID_NORMALIZED, type != "T"), 5)) %>%
+  select(denominator, field, n, epsilon_squared, rho, p_BH, starts_with("median_"))
+save_table(TOP_TYPES, "hazard_loss_top_five_excluding_informational_totals.csv")
+```
+
+### How much do the agricultural results depend on the cutoff?
+
+Repeat each grid with the $1 cutoff, using the same BH families. Compare the direction, significance, magnitude labels, and ranks. The sensitivity includes the drought agriculture cell. Drought total retains its original total-loss definition.
+
+```{r agricultural-sensitivity}
+CENT_GRIDS <- list(GRID_RAW, GRID_APPLICABLE, GRID_NORMALIZED)
+AG_SENSITIVITY <- bind_rows(lapply(seq_along(denominators), function(i) {
+  CENT <- CENT_GRIDS[[i]]
+  DOLLAR <- rank_grid(hazard_grid(denominators[i], cutoff = 1))
+  grid_comparison(CENT, DOLLAR) %>%
+    filter(field %in% AG_FIELDS) %>%
+    mutate(denominator = denominators[i],
+           n = CENT$n[match(field, CENT$field)],
+           H_cent = CENT$H[match(field, CENT$field)],
+           H_dollar = DOLLAR$H[match(field, DOLLAR$field)],
+           p_cent = CENT$p[match(field, CENT$field)],
+           p_dollar = DOLLAR$p[match(field, DOLLAR$field)],
+           positive_cent = CENT$n_positive[match(field, CENT$field)],
+           positive_dollar = DOLLAR$n_positive[match(field, DOLLAR$field)],
+           magnitude_changes = CENT$magnitude[match(field, CENT$field)] !=
+             DOLLAR$magnitude[match(field, DOLLAR$field)])
+}))
+AG_SENSITIVITY %>% as.data.frame()
+save_table(AG_SENSITIVITY, "hazard_agricultural_cent_vs_dollar_sensitivity.csv")
+```
+
+At $1, no agricultural cell changes direction, BH significance at 0.05, or effect-size category in any of the three grids. The largest shift in grid rank is `r max(abs(AG_SENSITIVITY$rank_change), na.rm = TRUE)` places.
+
+### Separate occurrence and magnitude for sparse hazards
+
+For each available loss type in the four sparse hazards, split the comparison into the chance of any loss and the magnitude of positive loss. For the chance of any loss, use a chi-squared test across available ratings and a Cochran–Armitage trend test with scores 1 through 5. Report Cramér's V and the Very High minus Very Low prevalence difference in percentage points. When expected counts fall below five, simulate the chi-squared p-value with 10,000 replicates. For magnitude, compare positive losses with Kruskal–Wallis. An outcome with no variation in loss occurrence has no occurrence test. Coastal flooding appears here and in both raw grids because its positive share is close to 15%.
+
+```{r sparse-hazards}
+set.seed(42)
+SPARSE <- bind_rows(lapply(CELLS$field[CELLS$hazard %in% sparse_hazards], function(field) {
+  present <- PART1[[paste0(substr(field, 1, 4), "_present")]]
+  bind_rows(lapply(denominators[1:2], function(denominator) {
+    all_counties <- denominator == "All counties"
+    x <- hazard_loss(field, zero_fill = all_counties)
+    keep <- if (all_counties) rep(TRUE, length(x)) else present
+    counts <- table(PART1$SOVI_RATNG[keep], factor(x[keep] > 0, levels = c(FALSE, TRUE)))
+    n_group <- rowSums(counts)
+    occurrence <- counts[, "TRUE"]
+    prevalence <- occurrence / n_group
+    observed <- n_group > 0
+    take_test <- sum(observed) >= 2 && all(colSums(counts) > 0)
+    chi_p <- chi <- trend_p <- trend_stat <- cramer_v <- NA_real_
+    chi_method <- "Unavailable"
+    if (take_test) {
+      test_counts <- counts[observed, , drop = FALSE]
+      chi_test <- suppressWarnings(chisq.test(test_counts))
+      chi <- unname(chi_test$statistic)
+      cramer_v <- sqrt(chi / sum(test_counts))
+      simulate <- any(chi_test$expected < 5)
+      chi_p <- if (simulate) chisq.test(test_counts, simulate.p.value = TRUE, B = 10000)$p.value else chi_test$p.value
+      chi_method <- if (simulate) "Monte Carlo" else "Asymptotic"
+      trend_test <- prop.trend.test(occurrence[observed], n_group[observed], score = which(observed))
+      trend_p <- trend_test$p.value
+      trend_stat <- unname(trend_test$statistic)
+    }
+    magnitude <- hazard_test(x, keep & !is.na(x) & x > 0)
+    data.frame(field = field, denominator = denominator, n = sum(keep),
+               chi_squared = chi, chi_p = chi_p, chi_method = chi_method, cramer_v = cramer_v,
+               trend_chi_squared = trend_stat, trend_p = trend_p,
+               VH_minus_VL_pp = 100 * (prevalence[5] - prevalence[1]),
+               magnitude_n = magnitude$n, magnitude_H = magnitude$H,
+               magnitude_df = magnitude$df, magnitude_p = magnitude$p,
+               magnitude_epsilon_squared = magnitude$epsilon_squared,
+               magnitude_rho = magnitude$rho, magnitude[grep("^median_", names(magnitude))],
+               as.list(setNames(as.integer(n_group), paste0("n_", c("VL", "RL", "RM", "RH", "VH")))),
+               as.list(setNames(as.integer(occurrence), paste0("positive_", c("VL", "RL", "RM", "RH", "VH")))),
+               as.list(setNames(100 * as.double(prevalence), paste0("percent_", c("VL", "RL", "RM", "RH", "VH")))),
+               row.names = NULL)
+  }))
+}))
+SPARSE %>% select(field, denominator, n, starts_with("percent_"), chi_p, cramer_v,
+                  trend_p, VH_minus_VL_pp) %>% as.data.frame()
+SPARSE %>% select(field, denominator, magnitude_n, magnitude_p,
+                  magnitude_epsilon_squared, starts_with("median_")) %>% as.data.frame()
+save_table(SPARSE, "sparse_hazard_occurrence_and_positive_magnitude.csv")
+```
+
+For coastal flooding total loss, the proportion with any loss rises from about 9% in Very Low to 20% in Very High across all counties. Among applicable counties it falls from about 83% to 74%. Among the 469 counties with positive total loss, the magnitude comparison has a negligible rank effect. The two-part results show how the all-county pattern can reflect where the hazard applies and how often counties have positive loss.
+
+### Visualize the grid
+
+Darker tiles indicate larger rank effects. A plus or minus sign gives the direction of Spearman's rho. Stars indicate BH-adjusted significance at 0.05, 0.01, and 0.001. A dagger marks a sparse hazard. Both heatmaps use the same fill scale. Rank shifts can reflect exposure differences or the change in the population eligible for normalization.
+
+```{r hazard-heatmaps, fig.width=8, fig.height=8}
+fill_limits <- c(0, max(c(GRID_RAW$epsilon_squared, GRID_NORMALIZED$epsilon_squared), na.rm = TRUE))
+heatmap_plot <- function(DATA, title) {
+  DATA <- DATA %>%
+    mutate(loss_type = factor(unname(loss_labels[type]), levels = unname(loss_labels)),
+           hazard_label = paste0(hazard, if_else(sparse, " †", "")),
+           hazard_label = factor(hazard_label, levels = rev(sort(unique(hazard_label)))),
+           stars = case_when(p_BH < 0.001 ~ "***", p_BH < 0.01 ~ "**", p_BH < 0.05 ~ "*", TRUE ~ ""),
+           sign = case_when(rho > 0 ~ "+", rho < 0 ~ "−", rho == 0 ~ "0", TRUE ~ ""),
+           label = if_else(is.na(epsilon_squared), "", paste0(sign, stars)),
+           text_color = epsilon_squared > 0.55 * fill_limits[2])
+  ggplot(DATA, aes(loss_type, hazard_label, fill = epsilon_squared)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = label, color = text_color), na.rm = TRUE) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "white"), guide = "none") +
+    scale_fill_gradient(low = "white", high = "steelblue4", limits = fill_limits, name = "Epsilon-squared") +
+    labs(title = title, x = "Loss type", y = "Hazard") +
+    theme_minimal() +
+    theme(panel.grid = element_blank(), legend.position = "bottom")
+}
+RAW_PLOT <- heatmap_plot(GRID_RAW, "Hazard losses across all rated counties")
+NORMALIZED_PLOT <- heatmap_plot(GRID_NORMALIZED, "Hazard losses per dollar of exposure")
+RAW_PLOT
+NORMALIZED_PLOT
+save_figure(RAW_PLOT, "hazard_loss_raw_epsilon_squared_heatmap.png", 8, 8)
+save_figure(NORMALIZED_PLOT, "hazard_loss_exposure_normalized_epsilon_squared_heatmap.png", 8, 8)
+```
+
+Among specific loss types, hurricane population-equivalence loss ranks first in the all-county headline grid. Its median rises from zero in Very Low to approximately $7,500 in Very High. It remains positively associated with vulnerability in the applicable-only and exposure-normalized grids. Tsunami building loss has the largest normalized effect among specific loss types and a negative association, based on only 108 counties with positive exposure. This ranking describes that smaller group. The applicable-only comparison also changes the direction of the tsunami association, so both the population being compared and the exposure denominator matter.
+
+## Controls and prediction
+
+### Choose the outcomes
+
+Start with county total loss. For each hazard, take its highest-ranked specific loss type in the all-county grid among cells with at least 300 positive counties. Keep the four highest-ranked distinct hazards. Tsunami, avalanche, and volcanic activity fall below the sample-size threshold. Their occurrence and positive-loss results are in the sparse-hazard tables.
+
+```{r model-targets}
+library(tidymodels)
+
+positive_minimum <- 300
+TARGETS <- GRID_RAW %>%
+  filter(type != "T", n_positive >= positive_minimum) %>%
+  distinct(hazard, .keep_all = TRUE) %>%
+  slice_head(n = 4) %>%
+  select(field, hazard, exposure, rank, n_positive) %>%
+  bind_rows(data.frame(field = "EAL_VALT", hazard = NA_character_, exposure = "BUILDVALUE",
+                       rank = NA_integer_, n_positive = sum(PART1$EAL_VALT > 0)), .)
+TARGETS
+save_table(TARGETS, "model_target_selection.csv")
+```
+
+### Compare the same counties across three regressions
+
+Fit all three models on the complete rows for the fully adjusted specification. This keeps sample changes from affecting the slope comparison. The one-cent rule determines which derived agricultural losses are positive. Take the base-10 log of the original loss among qualifying rows. Connecticut has no matching population records and contributes no rows to these regressions. The first model uses the SOVI score alone. The second adds state indicators. The third also adds log exposure, hazard frequency when defined, log county area, and log population.
+
+Conventional standard errors follow the lecture's regression examples. State-clustered HC1 standard errors account for within-state dependence, using the number of states minus one for the t reference distribution. Convert the slope and both confidence limits to percent change per 10 SOVI points. These are conditional associations among positive-loss counties.
+
+```{r controlled-regressions}
+percent_change <- function(beta) 100 * (10^(10 * beta) - 1)
+
+regression_data <- function(target, cutoff = 0.01) {
+  hazard <- target$hazard
+  loss <- hazard_loss(target$field, cutoff = cutoff)
+  exposure <- PART1[[target$exposure]]
+  MODEL_DATA <- PART1 %>%
+    transmute(SOVI_SCORE, STATEABBRV = factor(STATEABBRV), AREA, TOT_POP,
+              loss = loss, exposure = exposure)
+  if (!is.na(hazard)) {
+    MODEL_DATA$frequency <- PART1[[paste0(hazard, "_AFREQ")]]
+  }
+  MODEL_DATA %>%
+    filter(if_all(everything(), ~ !is.na(.x)), loss > 0, exposure > 0,
+           AREA > 0, TOT_POP > 0) %>%
+    mutate(STATEABBRV = droplevels(STATEABBRV), log_loss = log10(loss),
+           log_exposure = log10(exposure), log_area = log10(AREA), log_pop = log10(TOT_POP))
+}
+
+fit_regressions <- function(DATA) {
+  M1 <- lm(log_loss ~ SOVI_SCORE, data = DATA)
+  M2 <- lm(log_loss ~ SOVI_SCORE + STATEABBRV, data = DATA)
+  M3 <- lm(log_loss ~ SOVI_SCORE + STATEABBRV + log_exposure + log_area + log_pop, data = DATA)
+  if ("frequency" %in% names(DATA)) {
+    M3 <- update(M3, . ~ . + frequency)
+  }
+  list("1. SOVI" = M1, "2. State" = M2, "3. State + exposure and size" = M3)
+}
+
+sovi_coefficient <- function(M, DATA) {
+  beta <- unname(coef(M)["SOVI_SCORE"])
+  conventional <- lmtest::coeftest(M)["SOVI_SCORE", ]
+  states <- nlevels(DATA$STATEABBRV)
+  V <- sandwich::vcovCL(M, cluster = DATA$STATEABBRV, type = "HC1")
+  clustered <- lmtest::coeftest(M, vcov. = V, df = states - 1)["SOVI_SCORE", ]
+  ci_conventional <- confint(M, parm = "SOVI_SCORE")[1, ]
+  ci_cluster <- beta + c(-1, 1) * qt(0.975, states - 1) * clustered[2]
+  data.frame(n = nobs(M), states = states, beta = beta,
+             percent_per_10 = percent_change(beta),
+             conventional_SE = unname(conventional[2]), conventional_p = unname(conventional[4]),
+             conventional_lower = percent_change(ci_conventional[1]),
+             conventional_upper = percent_change(ci_conventional[2]),
+             clustered_SE = unname(clustered[2]), clustered_p = unname(clustered[4]),
+             clustered_lower = percent_change(ci_cluster[1]),
+             clustered_upper = percent_change(ci_cluster[2]),
+             adjusted_R2 = summary(M)$adj.r.squared)
+}
+
+REG_DATA <- lapply(seq_len(nrow(TARGETS)), function(i) regression_data(TARGETS[i, ]))
+REG_FITS <- lapply(REG_DATA, fit_regressions)
+REGRESSIONS <- bind_rows(lapply(seq_along(REG_FITS), function(i) {
+  FITS <- REG_FITS[[i]]
+  stopifnot(all(sapply(FITS, nobs) == nrow(REG_DATA[[i]])))
+  bind_rows(lapply(names(FITS), function(model) {
+    data.frame(target = TARGETS$field[i], model = model,
+               sovi_coefficient(FITS[[model]], REG_DATA[[i]]))
+  }))
+}))
+knitr::kable(REGRESSIONS, digits = 4)
+save_table(REGRESSIONS, "sovi_nested_regressions_conventional_and_clustered.csv")
+
+ag_target <- TARGETS[TARGETS$field %in% AG_FIELDS, ]
+DOLLAR_DATA <- regression_data(ag_target, cutoff = 1)
+DOLLAR_FITS <- fit_regressions(DOLLAR_DATA)
+DOLLAR_REG <- bind_rows(lapply(names(DOLLAR_FITS), function(model) {
+  data.frame(target = ag_target$field, model = model,
+             sovi_coefficient(DOLLAR_FITS[[model]], DOLLAR_DATA))
+}))
+DOLLAR_REG
+save_table(DOLLAR_REG, "sovi_agricultural_regressions_one_dollar_sensitivity.csv")
+```
+
+```{r coefficient-plot, fig.width=10, fig.height=8}
+INFERENCE <- bind_rows(
+  REGRESSIONS %>% transmute(target, model, percent_per_10, inference = "Conventional",
+                           lower = conventional_lower, upper = conventional_upper),
+  REGRESSIONS %>% transmute(target, model, percent_per_10, inference = "State clustered",
+                           lower = clustered_lower, upper = clustered_upper)
+) %>% mutate(model = factor(model, levels = rev(unique(REGRESSIONS$model))),
+             target = factor(target, levels = TARGETS$field))
+P <- ggplot(INFERENCE, aes(percent_per_10, model, color = inference)) +
+  geom_vline(xintercept = 0, color = "gray60", linetype = 2) +
+  geom_pointrange(aes(xmin = lower, xmax = upper), position = position_dodge(width = 0.5),
+                  orientation = "y") +
+  facet_wrap(~ target, scales = "free_x", ncol = 2) +
+  labs(x = "Percent change in loss per 10 SOVI points", y = NULL, color = NULL) +
+  theme_minimal()
+P
+save_figure(P, "sovi_nested_regression_coefficient_intervals.png", 10, 8)
+```
+
+Adding state cuts the SOVI slope for total loss, hurricane population-equivalence loss, and earthquake population-equivalence loss. Exposure and county size reduce all three slopes further. In Model 3, the state-clustered intervals exclude zero for hurricane and earthquake population-equivalence losses. For total loss, the state-clustered interval includes zero even though the conventional interval excludes zero.
+
+The cold-wave agriculture slope changes from negative to positive when state is added. The winter-weather building slope approaches zero after adding state and changes from slightly negative to positive after adding exposure and size. Both adjusted slopes have intervals that include zero. For cold-wave agriculture at the $1 cutoff, the adjusted point estimate changes sign again, and its interval still includes zero.
+
+Use residuals versus fitted values and normal Q–Q plots to check model form and tail behavior. These plots use the fully adjusted regression for each outcome.
+
+```{r model-diagnostics, fig.width=9, fig.height=13}
+plot_diagnostics <- function() {
+  old_par <- par(mfrow = c(nrow(TARGETS), 2), mar = c(4, 4, 3, 1))
+  on.exit(par(old_par))
+  for (i in seq_len(nrow(TARGETS))) {
+    M <- REG_FITS[[i]][[3]]
+    plot(fitted(M), residuals(M), pch = 16, cex = 0.35, col = "gray50",
+         main = paste(TARGETS$field[i], "- residuals vs fitted"),
+         xlab = "Fitted log10 dollars", ylab = "Residual")
+    abline(h = 0, lty = 2)
+    lines(lowess(fitted(M), residuals(M)), col = "steelblue", lwd = 2)
+    qqnorm(rstandard(M), pch = 16, cex = 0.35, col = "gray50",
+           main = paste(TARGETS$field[i], "- Q–Q"))
+    qqline(rstandard(M), col = "steelblue", lwd = 2)
+  }
+}
+plot_diagnostics()
+save_base_figure(plot_diagnostics, "sovi_adjusted_regression_residual_diagnostics.png", 9, 13)
+```
+
+The adjusted total-loss residuals are roughly centered, with departures in both Q–Q tails. The hurricane and earthquake population-equivalence diagnostics show especially large negative residuals. Cold-wave agriculture shows uneven spread, and winter-weather building loss shows some curvature. The clustered intervals describe slope uncertainty in the presence of within-state dependence. The plots also show where the fitted linear mean can miss individual counties.
+
+### Predict positive loss in held-out states
+
+Use the allowed exposure, hazard context, size, and Census fields. Derive the four regions from base R's `state.region`, relabel North Central as Midwest, and assign the District of Columbia to South. Puerto Rico has no assignment in this four-region scheme and is excluded from the forest comparison. The regressions can retain Puerto Rico because they use state and territory indicators. Forests use complete rows with a Census region and positive loss. They retain recorded zero agricultural value when it is a predictor other than the matching exposure. The forest cohort can differ from the regression cohort. The supplied earthquake event count is missing for every positive-loss county, so the earthquake forest uses annualized frequency and exposure area without the event count.
+
+Use five state-grouped folds, balanced by number of observations. The baseline predicts the mean log loss in the training fold. The linear comparator uses the adjusted regression's continuous terms plus region in place of state. Both forests use 300 trees, a minimum node size of five, and the same split-candidate count per target, fixed at the integer square root of the number of predictors in the smaller forest. Compare all models on identical holdout rows. Report ordinary prediction R² and RMSE, pooled across held-out rows, and retain the fold-level scores.
+
+```{r forest-data}
+region_map <- setNames(as.character(state.region), state.abb)
+region_map[region_map == "North Central"] <- "Midwest"
+region_map["DC"] <- "South"
+stopifnot(setequal(names(region_map), c(state.abb, "DC")))
+
+forest_data <- function(target) {
+  hazard <- target$hazard
+  loss <- hazard_loss(target$field)
+  context <- if (!is.na(hazard)) paste0(hazard, c("_AFREQ", "_EVNTS", "_EXP_AREA")) else character()
+  missing_context <- context[vapply(context, function(field) {
+    all(is.na(PART1[[field]][which(loss > 0)]))
+  }, logical(1))]
+  stopifnot(all(missing_context %in% "ERQK_EVNTS"))
+  context <- setdiff(context, missing_context)
+  predictors <- unique(c("SOVI_SCORE", target$exposure, context, "AREA", "BUILDVALUE", "AGRIVALUE",
+                         "MEDIAN_AGE", "share_65plus", "renter_share", "white_share", "black_share",
+                         "native_share", "asian_share", "other_race_share"))
+  stopifnot(!any(grepl("EAL|RISK", predictors)))
+  PART1 %>%
+    select(all_of(c("STATEABBRV", "TOT_POP", predictors))) %>%
+    mutate(loss = loss, region = factor(unname(region_map[STATEABBRV]),
+                                       levels = c("Northeast", "Midwest", "South", "West"))) %>%
+    filter(if_all(everything(), ~ !is.na(.x)), loss > 0, TOT_POP > 0,
+           .data[[target$exposure]] > 0, AREA > 0) %>%
+    mutate(log_loss = log10(loss), log_pop = log10(TOT_POP)) %>%
+    select(-TOT_POP, -loss)
+}
+
+prediction_scores <- function(DATA) {
+  sse <- sum((DATA$log_loss - DATA$prediction)^2)
+  sst <- sum((DATA$log_loss - mean(DATA$log_loss))^2)
+  data.frame(n = nrow(DATA), RMSE = sqrt(sse / nrow(DATA)), R2 = if (sst > 0) 1 - sse / sst else NA_real_)
+}
+```
+
+```{r forest-resampling}
+run_forest <- function(target) {
+  DATA <- forest_data(target)
+  TRAINING <- select(DATA, -STATEABBRV)
+  smaller_count <- ncol(TRAINING) - 2
+  specification <- rand_forest(trees = 300, mtry = floor(sqrt(smaller_count)), min_n = 5) %>%
+    set_engine("ranger", num.threads = 1) %>% set_mode("regression")
+
+  make_workflow <- function(columns) {
+    RECIPE <- recipe(log_loss ~ ., data = TRAINING[columns]) %>%
+      step_dummy(all_nominal_predictors()) %>%
+      step_zv(all_predictors())
+    workflow() %>% add_recipe(RECIPE) %>% add_model(specification)
+  }
+  full <- make_workflow(names(TRAINING))
+  no_sovi <- make_workflow(setdiff(names(TRAINING), "SOVI_SCORE"))
+  linear_terms <- c("SOVI_SCORE", paste0("log(", target$exposure, ", base = 10)"),
+                    "log10(AREA)", "log_pop", "region")
+  if (!is.na(target$hazard)) linear_terms <- c(linear_terms, paste0(target$hazard, "_AFREQ"))
+  linear_formula <- reformulate(linear_terms, response = "log_loss")
+
+  set.seed(42)
+  FOLDS <- group_vfold_cv(DATA, group = STATEABBRV, v = 5, balance = "observations")
+  REPEATS <- bind_rows(lapply(seq_len(nrow(FOLDS)), function(i) {
+    train <- analysis(FOLDS$splits[[i]])
+    test <- assessment(FOLDS$splits[[i]])
+    stopifnot(!any(train$STATEABBRV %in% test$STATEABBRV),
+              all(unique(test$region) %in% unique(train$region)))
+    train <- select(train, -STATEABBRV)
+    test <- select(test, -STATEABBRV)
+    M <- lm(linear_formula, data = train)
+    with_sovi <- fit(full, data = train)
+    without_sovi <- fit(no_sovi, data = select(train, -SOVI_SCORE))
+    predictions <- list("Training mean" = rep(mean(train$log_loss), nrow(test)),
+                        "Linear with region" = predict(M, newdata = test),
+                        "Forest with SOVI" = predict(with_sovi, new_data = test)$.pred,
+                        "Forest without SOVI" = predict(without_sovi, new_data = select(test, -SOVI_SCORE))$.pred)
+    bind_rows(lapply(names(predictions), function(model) {
+      data.frame(target = target$field, fold = FOLDS$id[i], model = model,
+                 n_train = nrow(train), log_loss = test$log_loss, prediction = predictions[[model]])
+    }))
+  }))
+  stopifnot(all(is.finite(REPEATS$prediction)), nrow(REPEATS) == 4 * nrow(DATA))
+  set.seed(42)
+  list(DATA = TRAINING, CV = REPEATS, final = fit(full, data = TRAINING))
+}
+
+FORESTS <- lapply(seq_len(nrow(TARGETS)), function(i) run_forest(TARGETS[i, ]))
+CV <- bind_rows(lapply(FORESTS, function(result) result$CV))
+CV_FOLDS <- CV %>% group_by(target, fold, model, n_train) %>% group_modify(~ prediction_scores(.x)) %>% ungroup()
+CV_POOLED <- CV %>% group_by(target, model) %>% group_modify(~ prediction_scores(.x)) %>% ungroup()
+knitr::kable(CV_POOLED, digits = 4)
+CV_FOLDS %>% as.data.frame()
+save_table(CV_FOLDS, "state_grouped_model_comparison_by_fold.csv")
+save_table(CV_POOLED, "state_grouped_model_comparison_pooled.csv")
+```
+
+### Permutation importance and partial dependence
+
+Fit the final forest with SOVI on all complete training rows for each outcome. Use DALEX as in the lecture. Permutation importance measures the increase in RMSE from shuffling a predictor, using ten seeded repetitions with up to 1,000 sampled rows per repetition from the full-data fit. It is an in-sample description of that fit. The state-grouped scores above measure held-out prediction.
+
+Calculate partial dependence across all complete rows over 31 equally spaced scores spanning their observed range. Show individual conditional expectation curves for a random sample of 100 of those rows. The dashed line shows the fully adjusted regression slope, anchored to the forest curve near the middle score to compare shapes. Both plots describe model associations and can include score and predictor combinations that are uncommon in the data.
+
+```{r forest-explanations, fig.width=10, fig.height=10}
+explain_forest <- function(result, target) {
+  DATA <- select(result$DATA, -log_loss)
+  EXPLAINER <- DALEXtra::explain_tidymodels(result$final, data = DATA,
+                                          y = result$DATA$log_loss, label = target,
+                                          verbose = FALSE)
+  set.seed(42)
+  IMPORTANCE <- DALEX::model_parts(EXPLAINER, loss_function = DALEX::loss_root_mean_square,
+                                   type = "difference", N = min(1000, nrow(DATA)), B = 10)
+  importance <- data.frame(target = target, n_fit = nrow(DATA),
+                           n_importance = min(1000, nrow(DATA)), as.data.frame(IMPORTANCE))
+  scores <- seq(min(DATA$SOVI_SCORE), max(DATA$SOVI_SCORE), length.out = 31)
+  splits <- list(SOVI_SCORE = scores)
+  PROFILE <- DALEX::model_profile(EXPLAINER, variables = "SOVI_SCORE", N = NULL,
+                                 variable_splits = splits, type = "partial")
+  set.seed(42)
+  ICE <- DALEX::model_profile(EXPLAINER, variables = "SOVI_SCORE", N = 100,
+                             variable_splits = splits, type = "partial")
+  profiles <- data.frame(target = target, score = as.numeric(PROFILE$agr_profiles$`_x_`),
+                         log_loss = PROFILE$agr_profiles$`_yhat_`)
+  individual <- data.frame(target = target, score = ICE$cp_profiles$SOVI_SCORE,
+                           log_loss = ICE$cp_profiles$`_yhat_`, county = ICE$cp_profiles$`_ids_`)
+  stopifnot(nrow(profiles) == 31, length(unique(individual$county)) == 100)
+  list(importance = importance, profiles = profiles, individual = individual)
+}
+EXPLANATIONS <- lapply(seq_along(FORESTS), function(i) explain_forest(FORESTS[[i]], TARGETS$field[i]))
+IMPORTANCE <- bind_rows(lapply(EXPLANATIONS, function(result) result$importance))
+PROFILES <- bind_rows(lapply(EXPLANATIONS, function(result) result$profiles))
+ICE <- bind_rows(lapply(EXPLANATIONS, function(result) result$individual))
+SLOPES <- REGRESSIONS %>% filter(grepl("^3", model)) %>% select(target, beta)
+PROFILES <- PROFILES %>% left_join(SLOPES, by = "target") %>%
+  group_by(target) %>% arrange(score, .by_group = TRUE) %>%
+  mutate(adjusted_lm = log_loss[16] + beta * (score - score[16])) %>% ungroup()
+
+IMPORTANCE %>% filter(variable == "SOVI_SCORE", permutation == 0) %>% as.data.frame()
+save_table(IMPORTANCE, "forest_dalex_full_fit_permutation_importance.csv")
+save_table(PROFILES, "forest_dalex_sovi_partial_dependence_and_adjusted_slope.csv")
+save_table(ICE, "forest_dalex_sovi_ice_100_counties.csv")
+P <- ggplot(PROFILES, aes(score, log_loss)) +
+  geom_line(data = ICE, aes(group = county), color = "gray55", alpha = 0.2, linewidth = 0.3) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_line(aes(y = adjusted_lm), color = "firebrick", linetype = 2) +
+  facet_wrap(~ target, scales = "free", ncol = 2) +
+  labs(x = "Social vulnerability score", y = "Log10 dollars",
+       subtitle = "Blue: partial dependence. Gray: 100 counties. Dashed: adjusted regression slope.") +
+  theme_minimal()
+P
+save_figure(P, "forest_sovi_partial_dependence_ice_and_adjusted_slope.png", 10, 10)
+```
+
+### What does SOVI add after accounting for other predictors?
+
+```{r sovi-model-summary}
+CV_GAIN <- CV_POOLED %>%
+  filter(model == "Forest with SOVI") %>%
+  select(target, n, RMSE_with = RMSE, R2_with = R2) %>%
+  left_join(CV_POOLED %>% filter(model == "Forest without SOVI") %>%
+              select(target, RMSE_without = RMSE, R2_without = R2), by = "target") %>%
+  mutate(RMSE_reduction = RMSE_without - RMSE_with,
+         R2_gain = R2_with - R2_without)
+SOVI_IMPORTANCE <- IMPORTANCE %>%
+  filter(permutation == 0, !grepl("^_", variable)) %>%
+  group_by(target) %>%
+  mutate(importance_rank = min_rank(desc(dropout_loss))) %>%
+  ungroup() %>%
+  filter(variable == "SOVI_SCORE") %>%
+  select(target, n_importance, importance_rank, permutation_RMSE_increase = dropout_loss)
+PROFILE_CHANGE <- PROFILES %>%
+  group_by(target) %>%
+  summarize(score_min = min(score), score_max = max(score),
+            forest_end_minus_start = last(log_loss) - first(log_loss),
+            adjusted_lm_end_minus_start = last(adjusted_lm) - first(adjusted_lm),
+            forest_range = diff(range(log_loss)), .groups = "drop")
+MODEL_SUMMARY <- CV_GAIN %>%
+  left_join(SOVI_IMPORTANCE, by = "target") %>%
+  left_join(PROFILE_CHANGE, by = "target")
+MODEL_SUMMARY %>% as.data.frame()
+save_table(MODEL_SUMMARY, "sovi_incremental_prediction_and_profile_summary.csv")
+```
+
+The forests with SOVI outperform the naive baseline for all five targets. Adding SOVI changes held-out RMSE by less than 0.004 log10 dollars for each target. The modest gains for hurricane population-equivalence, cold-wave agriculture, and winter-weather building loss do not establish a substantial predictive contribution. For total and earthquake population-equivalence loss, held-out RMSE is slightly lower without SOVI. One earthquake fold performs poorly in the linear comparator, which explains why its pooled R² falls below the training-mean baseline. The forest comparison addresses prediction in held-out states, while the clustered regression intervals describe conditional associations within the observed data.
+
+The hurricane and earthquake population-equivalence profiles rise overall but flatten or dip near the top of the SOVI range. Both rise less across the observed range than the adjusted regression lines. Total loss has a shallow upward profile. Cold-wave agriculture has a midrange hump and similar predictions at the score extremes. Winter-weather building loss declines at the high end, while the adjusted linear slope is slightly positive with an interval that includes zero. In-sample permutation importance and the small held-out gains answer different questions. A fitted forest can use SOVI even when its inclusion adds little predictive value in new states.
+
+## Answers
+
+### How much of the positive SOVI slope remains after controls?
+
+The decomposition uses the log10-dollar coefficients per SOVI point. Divide the change when adding state by the Model 1 slope, then do the same for the change when adding exposure and size. The last share is the fully adjusted slope divided by the Model 1 slope. These describe changes between fitted models. Sign reversals make the shares difficult to interpret. For practical size, convert each fully adjusted slope and its state-clustered interval across a 50-point SOVI gap using \(100(10^{5\beta_{10}}-1)\), where \(\beta_{10}=10b_3\).
+
+```{r slope-decomposition}
+sovi_gap <- 50
+gap_change <- function(beta) 100 * (10^(sovi_gap * beta) - 1)
+DECOMPOSITION <- bind_rows(lapply(TARGETS$field, function(field) {
+  DATA <- filter(REGRESSIONS, target == field) %>% arrange(model)
+  b <- DATA$beta
+  sign_change <- any(sign(b) != sign(b[1]))
+  shares <- if (b[1] > 0 && !sign_change) {
+    100 * c((b[1] - b[2]) / b[1], (b[2] - b[3]) / b[1], b[3] / b[1])
+  } else {
+    rep(NA_real_, 3)
+  }
+  data.frame(target = field, n = DATA$n[3], b1 = b[1], b2 = b[2], b3 = b[3],
+             state_percent = shares[1], exposure_and_size_percent = shares[2],
+             remaining_percent = shares[3],
+             share_note = if (sign_change) "Coefficient changes sign" else "",
+             M3_percent_per_50 = gap_change(b[3]),
+             M3_clustered_lower_per_50 = 100 * ((1 + DATA$clustered_lower[3] / 100)^(sovi_gap / 10) - 1),
+             M3_clustered_upper_per_50 = 100 * ((1 + DATA$clustered_upper[3] / 100)^(sovi_gap / 10) - 1))
+}))
+stopifnot(all(abs(rowSums(na.omit(DECOMPOSITION[c("state_percent", "exposure_and_size_percent",
+                                                 "remaining_percent")])) - 100) < 1e-10))
+save_table(DECOMPOSITION, "sovi_slope_decomposition_and_50_point_effects.csv")
+
+BUILDING_VALUES <- PART1 %>%
+  group_by(SOVI_RATNG) %>%
+  summarize(n = n(), median_building_value = median(BUILDVALUE), .groups = "drop")
+save_table(BUILDING_VALUES, "building_value_by_sovi_rating.csv")
+```
+
+```{r written-findings, results='asis', echo=FALSE}
+number <- function(x) formatC(x, format = "d", big.mark = ",")
+fixed <- function(x, digits = 3) formatC(x, format = "f", digits = digits, big.mark = ",")
+dollars <- function(x) paste0("$", fixed(x, 0))
+billions <- function(x) paste0("$", fixed(x / 1e9, 2), " billion")
+p_text <- function(x) formatC(x, format = "e", digits = 2)
+percent <- function(x) paste0(fixed(x, 2), "%")
+
+target_names <- c(EAL_VALT = "County total", HRCN_EALPE = "Hurricane population equivalence",
+                  CWAV_EALA = "Cold-wave agriculture", ERQK_EALPE = "Earthquake population equivalence",
+                  WNTW_EALB = "Winter-weather building", TSUN_EALB = "Tsunami building")
+raw_top <- filter(GRID_RAW, type != "T") %>% slice_head(n = 1)
+norm_top <- filter(GRID_NORMALIZED, type != "T") %>% slice_head(n = 1)
+raw_normalized <- filter(GRID_NORMALIZED, field == raw_top$field)
+raw_medians <- unlist(raw_top[grep("^median_", names(raw_top))], use.names = FALSE)
+ADJUSTED <- REGRESSIONS %>% filter(grepl("^3", model))
+SURVIVING <- ADJUSTED %>% filter(clustered_lower > 0) %>% arrange(desc(percent_per_10))
+stopifnot(identical(SURVIVING$target, c("HRCN_EALPE", "ERQK_EALPE")),
+          raw_top$field == "HRCN_EALPE", norm_top$field == "TSUN_EALB")
+CA <- filter(GRID_RAW, field == "CWAV_EALA")
+building_medians <- setNames(BUILDING_VALUES$median_building_value, BUILDING_VALUES$SOVI_RATNG)
+lowest <- ratings[1]
+highest <- tail(ratings, 1)
+middle <- ratings[2:4]
+bh_counts <- vapply(GRIDS, function(DATA) sum(!is.na(DATA$p)), integer(1))
+
+adjusted_sentence <- function(DATA) {
+  paste0(target_names[DATA$target], " rose ", percent(DATA$percent_per_10),
+         " per 10 SOVI points (state-clustered 95% CI ",
+         percent(DATA$clustered_lower), " to ", percent(DATA$clustered_upper),
+         ", n = ", number(DATA$n), ").")
+}
+
+q1_text <- paste0(
+  "**Q1.** Total expected annual loss differs across SOVI ratings (n = ", number(Q1_KW$n[1]),
+  ", epsilon-squared = ", fixed(Q1_KW$epsilon_squared[1]), ", p = ", p_text(Q1_KW$p[1]),
+  "), with median losses of ", dollars(GROUPS$median_dollars[1]), " in Very Low and ",
+  dollars(tail(GROUPS$median_dollars, 1)), " in Very High.")
+
+line1_text <- paste0(
+  "**Line 1 — Loss type.** Building loss follows total loss, population-equivalence dollars peak in ",
+  TYPE_SUMMARY$highest_median[TYPE_SUMMARY$outcome == "EAL_VALPE"],
+  ", and agricultural loss has a stronger rank association across ratings after division by agricultural value ",
+  "(epsilon-squared rises from ",
+  fixed(TYPE_SUMMARY$epsilon_squared[TYPE_SUMMARY$outcome == "EAL_VALA"]), " to ",
+  fixed(TYPE_SUMMARY$epsilon_squared[TYPE_SUMMARY$outcome == "A_ratio"]), ").")
+
+line2_text <- paste0(
+  "**Line 2 — Hazard × loss type.** Hurricane population equivalence has the strongest raw association ",
+  "among specific loss types (rho = +", fixed(raw_top$rho), "), while tsunami building loss ",
+  "has the strongest exposure-normalized association among specific loss types in a much smaller cohort ",
+  "(n = ", number(norm_top$n), ", epsilon-squared = ", fixed(norm_top$epsilon_squared),
+  ", rho = ", fixed(norm_top$rho), ").")
+
+raw_answer <- paste0(
+  "**Largest raw association.** Hurricane population-equivalence loss in the headline all-county grid ",
+  "(n = ", number(raw_top$n), ", epsilon-squared = ", fixed(raw_top$epsilon_squared),
+  ", rho = +", fixed(raw_top$rho), ", BH-adjusted p = ", p_text(raw_top$p_BH),
+  ") rises with vulnerability. From Very Low to Very High, median annual losses were ",
+  paste(dollars(raw_medians), collapse = ", "), ". The association stays positive after matching ",
+  "loss to exposure (n = ", number(raw_normalized$n), ", epsilon-squared = ",
+  fixed(raw_normalized$epsilon_squared), ", rho = +", fixed(raw_normalized$rho), ").")
+
+adjusted_answer <- paste(
+  "**Largest associations after controls.**",
+  adjusted_sentence(SURVIVING[1, ]), adjusted_sentence(SURVIVING[2, ]),
+  "These are the two positive associations whose state-clustered intervals exclude zero among the selected targets.",
+  "The independent role of SOVI after controls is small. These are adjusted associations in observational, modeled data."
+)
+
+occurrence_caveat <- paste0(
+  "**Occurrence and magnitude.** Stage 3 estimates loss magnitude among counties with positive loss. ",
+  "The Stage 2 headline grid captures both whether counties have any loss and the size of their losses. ",
+  "For cold-wave agriculture, ", number(CA$n_positive), " of ", number(CA$n),
+  " counties have positive loss. Its negative all-county pattern and near-zero fully adjusted ",
+  "positive-loss slope answer different questions.")
+
+normalization_text <- paste0(
+  "Normalization strengthens the SOVI pattern for total and building losses. For county total, ",
+  "epsilon-squared increases from ", fixed(Q1_KW$epsilon_squared[1]), " to ",
+  fixed(Q1_KW$epsilon_squared[2]), ". Dividing by building value gives more weight to a given dollar loss ",
+  "in counties with smaller building inventories. Median building value in Very High is ",
+  billions(building_medians[highest]), ", below the middle ratings' ",
+  paste(vapply(building_medians[middle], billions, character(1)), collapse = ", "),
+  " in rating order. This denominator difference helps explain why the high end separates more clearly. ",
+  "The normalized pattern is J-shaped, with similar levels across the lower ratings and a rise across the top two. ",
+  "Raw total loss does not clearly separate Very High from Relatively High.")
+
+methods_text <- paste0(
+  "Checked log-loss distributions with Q–Q plots, Shapiro–Wilk and Fligner–Killeen. ",
+  "Compared ranks with Kruskal–Wallis, epsilon-squared, Holm-adjusted Wilcoxon and signed Cliff's delta, ",
+  "and checked robustness with Welch ANOVA and Holm-adjusted Welch pairs. ",
+  "Used Spearman for trend, a county bootstrap for the score correlation, and LOESS and nested natural spline ",
+  "models for shape. Adjusted hazard Kruskal–Wallis p-values with separate Benjamini–Hochberg families ",
+  "for headline, applicable-only and normalized grids (", paste(bh_counts, collapse = ", "),
+  " tests, respectively). The headline grid places structural inapplicability at zero for the all-county comparison. ",
+  "The applicable-only grid retains recorded zeros and omits structural missingness. ",
+  "Derived agricultural losses below one cent count as zero, with a one-dollar sensitivity check. ",
+  "Neither cutoff changes the exported RDS. Sparse-hazard analyses separate occurrence and positive magnitude. ",
+  "Regressions use log10 of positive raw loss, conventional and state-clustered SEs. ",
+  "Forest performance uses state-grouped cross-validation. DALEX importance and profiles describe the full-data fits.")
+
+slide_text <- paste0(
+  "Counties rated Very High in social vulnerability had a median expected annual loss of ",
+  dollars(tail(GROUPS$median_dollars, 1)), ", compared with ", dollars(GROUPS$median_dollars[1]),
+  " in Very Low counties. That difference matters for planning because the same dollar loss can represent ",
+  "a larger share of what a county has exposed. Dividing by building value made the gap clearer in the ",
+  "highest-vulnerability counties. Hurricane population-equivalence loss, FEMA's dollar measure of ",
+  "impacts on people, showed the strongest raw relationship with vulnerability. After comparing positive-loss ",
+  "counties while accounting for state, exposure, frequency, area, and population, the hurricane and earthquake ",
+  "relationships remained positive but were much smaller. Adding the vulnerability score made little difference ",
+  "to how accurately the forests predicted loss in held-out states. For planning, these results support reading ",
+  "vulnerability alongside hazard exposure and county size, and asking separately where loss occurs and how ",
+  "large it is where it occurs. The estimates describe annual modeled losses.")
+
+LIMITATIONS <- c(
+  "FEMA EAL is modeled. Observed event losses would help validate the estimates.",
+  "County-level summaries hide variation across neighborhoods and census tracts.",
+  "The supplied data lack individual SOVI components such as income, disability, education, and language.",
+  paste0(number(sum(!PART1$in_census)), " Connecticut counties lack matching Census covariates and are absent from models requiring population."),
+  "County agricultural value approximates agricultural exposure because hazard-specific agricultural exposure is unavailable for the selected cold-wave target and other non-drought agricultural cells.",
+  "Hazard cells overlap. Total combines building, population-equivalence, and agricultural loss where those components apply.",
+  "Counties can be dependent within states. Clustered regression intervals and state-grouped prediction address this in Stage 3. The earlier county-based tests and bootstrap use counties as units.",
+  paste0("Puerto Rico (", number(sum(PART1$STATEABBRV == "PR")), " rated county equivalents in the input) is excluded from the forests because the four Census regions do not cover it."),
+  paste0("Sparse hazards such as tsunami, avalanche, and volcanic activity are excluded from Stage 3 by the ",
+         number(positive_minimum), "-positive-county minimum. Coastal flooding does not rank among the selected hazards.")
+)
+
+DISPLAY <- DECOMPOSITION %>%
+  mutate(target = unname(target_names[target]))
+DECOMP_PRINT <- DISPLAY %>%
+  select(target, n, b1, b2, b3, state_percent, exposure_and_size_percent,
+         remaining_percent, share_note) %>%
+  mutate(n = number(n), across(b1:b3, ~ fixed(.x, 5)),
+         across(state_percent:remaining_percent, ~ ifelse(is.na(.x), "—", paste0(fixed(.x, 1), "%"))))
+names(DECOMP_PRINT) <- c("Target", "n", "Model 1 b", "Model 2 b", "Model 3 b",
+                         "State share", "Exposure and size share", "Remaining share", "Note")
+GAP_PRINT <- DISPLAY %>%
+  transmute(Target = target, n = number(n), Estimate = percent(M3_percent_per_50),
+            Lower = percent(M3_clustered_lower_per_50), Upper = percent(M3_clustered_upper_per_50))
+
+# Include preparation outputs in the inventory even when rendering with the RDS alone.
+inventory_paths <- sort(unique(c("analysis.html", "findings.md", "part1_clean.rds",
+                                 "part1_clean.csv", "part1_data_dictionary.csv",
+                                 list.files("outputs/figures", pattern = "\\.png$", full.names = FALSE) %>%
+                                   file.path("figures", .),
+                                 list.files("outputs/tables", pattern = "\\.csv$", full.names = FALSE) %>%
+                                   file.path("tables", .))))
+INVENTORY <- data.frame(file = inventory_paths) %>%
+  mutate(rubric = case_when(
+    grepl("^part1_", file) ~ "Data description",
+    grepl("(^|/)building_value_", file) ~ "Q1, data description",
+    grepl("(^|/)q1_", file) ~ "Q1",
+    grepl("(^|/)loss_type_", file) ~ "Line 1",
+    grepl("(^|/)(hazard_agricultural_|sparse_hazard_)", file) ~ "Line 2, we wish we had",
+    grepl("(^|/)hazard_", file) ~ "Line 2, where does SOVI matter most",
+    grepl("(^|/)(sovi_|model_target_|forest_|state_grouped_)", file) ~ "Where does SOVI matter most",
+    TRUE ~ "Q1, Line 1, Line 2, where does SOVI matter most, data description, we wish we had"
+  ))
+report_table <- function(DATA) as.character(knitr::kable(DATA, format = "pipe"))
+FINDINGS <- c(
+  q1_text, "", line1_text, "", line2_text, "",
+  "### Where does SOVI matter most?", "", raw_answer, "", adjusted_answer, "",
+  occurrence_caveat, "",
+  "### Slope decomposition and practical size", "",
+  "Shares use the fitted log10-dollar slopes per SOVI point. They describe how the slope changes across models. Sign reversals are shown without shares.", "",
+  report_table(DECOMP_PRINT), "",
+  paste0("**Fully adjusted percent change across a ", sovi_gap, "-point SOVI gap.** Lower and upper are state-clustered 95% limits."), "",
+  report_table(GAP_PRINT), "",
+  "### Raw and normalized losses", "", normalization_text, "",
+  "### Methods", "", methods_text, "",
+  "### Limitations and additional data", "", paste0("- ", LIMITATIONS), "",
+  "### Why it matters", "", slide_text, "",
+  "### Output inventory", "",
+  "Paths are relative to the outputs folder. The preparation files come from the cleaning export.", "",
+  report_table(INVENTORY)
+)
+writeLines(enc2utf8(c("# Part 1 findings — Expected annual loss and social vulnerability", "",
+                      FINDINGS)), "outputs/findings.md", useBytes = TRUE)
+cat(FINDINGS, sep = "\n")
+```
